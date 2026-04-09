@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+# Execution/ contains generated workspaces (MBPP / SWE-bench / test runs)
+# These are reproducible outputs, not source code, and can grow very large
+Execution/
+
+# Memory backups
+memory.json.bak
+memory.py.bak
+
+# HuggingFace dataset cache
+.cache/
+
+# Logs and reports
+*.log
+mbpp_report.json
+swebench_report.jsonl
+
+# Local secrets (just in case)
+.env.local
+secrets.json
