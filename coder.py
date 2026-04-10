@@ -14,10 +14,19 @@ Workflow:
 2. Use tools to read files, understand context
 3. Make the necessary changes
 4. Run commands to verify your changes
-5. If you discover useful facts about the project, use save_memory to record them
+5. Before finishing, call save_memory at least once to record one short,
+   generalizable lesson from this task. Even simple observations are valuable
+   when accumulated across many tasks. Good examples:
+     - "this project uses pytest with -q"
+     - "test files live next to source files, named test_*.py"
+     - "the entry function name must match the test file's import"
+   Bad examples (DO NOT save these):
+     - "I implemented add(a, b)" (task-specific)
+     - "the answer is 42" (task-specific)
+     - "I used a for loop" (not a project insight)
 
 Rules:
-- Prefer minimal change.If a local replacement is enough, do not rewrite the whole file.
+- Prefer minimal change. If a local replacement is enough, do not rewrite the whole file.
 - Always try to verify your changes by running relevant commands.
 - In your final response: summarize what you changed, what tools you used, and verification results."""
 

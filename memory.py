@@ -94,24 +94,89 @@ def _normalize_fact(fact: str) -> str:
 # ---------------------------------------------------------------------------
 
 class MemoryManager:
-    def __init__(self, memory_file: Optional[str] = None):
+    """
+    Two operating modes:
+
+    1. **Single-file mode** (default): all data — project_context, task_history,
+       and facts — live in the same memory.json. This is the P0 / single-project
+       use case.
+
+    2. **Dual-file mode**: pass `global_facts_file=...` to split storage:
+         - `memory.json` (per-instance): project_context + task_history
+         - `global_facts.json` (shared): facts only
+       This is the benchmark mode (MBPP / SWE-bench), where each instance has
+       its own memory.json for inspection ("how did this instance fail?"), but
+       facts are pooled across instances so reinforcement actually happens.
+
+    The two modes are transparent to callers: `self.data["facts"]` always
+    returns the right set of facts; `_save()` writes to whichever file owns
+    each piece of data.
+    """
+
+    def __init__(
+        self,
+        memory_file: Optional[str] = None,
+        global_facts_file: Optional[str] = None,
+    ):
         if memory_file is None:
             memory_dir = os.path.join(config.WORKSHOP, config.PROJECT_NAME)
             os.makedirs(memory_dir, exist_ok=True)
             memory_file = os.path.join(memory_dir, "memory.json")
         self.memory_file = memory_file
+        self.global_facts_file = global_facts_file   # None = single-file mode
+
         self.data = self._load()
         self._working: Optional[WorkingMemory] = None
 
     def _load(self) -> dict:
+        # Always load per-instance file first (or default if missing)
         if os.path.exists(self.memory_file):
             with open(self.memory_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return self._default_data()
+                data = json.load(f)
+        else:
+            data = self._default_data()
+
+        # Dual-file mode: facts come from the shared global file, overriding
+        # whatever facts (probably empty) sit in the per-instance file.
+        if self.global_facts_file is not None:
+            data["facts"] = self._load_global_facts()
+
+        return data
+
+    def _load_global_facts(self) -> list:
+        """Read the shared facts file. Returns [] if it doesn't exist yet."""
+        if not os.path.exists(self.global_facts_file):
+            return []
+        with open(self.global_facts_file, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        # Tolerate either {"facts": [...]} or just [...] at the top level
+        if isinstance(payload, dict):
+            return payload.get("facts", [])
+        return payload
 
     def _save(self) -> None:
-        with open(self.memory_file, 'w', encoding='utf-8') as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        if self.global_facts_file is not None:
+            # Dual-file mode: write facts to global, everything else to per-instance
+            self._save_global_facts(self.data["facts"])
+            per_instance = {k: v for k, v in self.data.items() if k != "facts"}
+            # Keep an empty "facts" key in per-instance file so its schema is
+            # still valid if anything reads it directly.
+            per_instance["facts"] = []
+            with open(self.memory_file, 'w', encoding='utf-8') as f:
+                json.dump(per_instance, f, indent=2, ensure_ascii=False)
+        else:
+            # Single-file mode: original behavior
+            with open(self.memory_file, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+
+    def _save_global_facts(self, facts: list) -> None:
+        os.makedirs(os.path.dirname(self.global_facts_file), exist_ok=True)
+        payload = {
+            "facts": facts,
+            "updated_at": self._now(),
+        }
+        with open(self.global_facts_file, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
 
     def _default_data(self) -> dict:
         return {
@@ -146,7 +211,7 @@ class MemoryManager:
         return self._working
 
     def end_task(self, task_id: str, passed: bool, plan: list[str],
-                 attempts: int, summary: str) -> None:
+                 attempts: int, summary: str, error_history: list[dict] | None = None) -> None:
         wm = self._working
         files_changed = sorted(wm.files_changed) if wm else []
 
@@ -168,6 +233,8 @@ class MemoryManager:
             "attempts": attempts,
             "summary": summary,
         }
+        if error_history:
+            record["error_history"] = error_history
 
         self.data["task_history"].append(record)
         self._trim_task_history()
@@ -277,5 +344,15 @@ class MemoryManager:
         return datetime.now().isoformat(timespec='seconds')
 
     def generate_task_id(self) -> str:
+        """Generate a task_id for the next task.
+
+        Includes project_name as prefix so benchmark instances (which each
+        have their own per-instance memory.json) get distinguishable task_ids
+        instead of all becoming "0001". For long-running single-project use,
+        the prefix is still informative.
+        """
         count = len(self.data.get("task_history", []))
+        project = self.data.get("project_context", {}).get("project_name", "")
+        if project:
+            return f"{project}_{count + 1:04d}"
         return f"{count + 1:04d}"

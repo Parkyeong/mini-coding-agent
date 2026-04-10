@@ -122,7 +122,8 @@ def run_task(user_prompt:str, planner:Planner, coder:Coder,
             passed = overall_passed,
             plan = final_plan,
             attempts = total_attempts,
-            summary = "Completed successfully. " if overall_passed else "Failed. See error history for details."
+            summary = "Completed successfully. " if overall_passed else "Failed. See error history for details.",
+            error_history = error_history if not overall_passed else None
         )
 
 def _build_failure_context(plan:list, failed_step_idx:int, error_history:list)->str:

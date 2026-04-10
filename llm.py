@@ -183,7 +183,21 @@ class OpenAICompatible(BaseLLM):
 
         if message.tool_calls:
             for tc in message.tool_calls:
-                args = json.loads(tc.function.arguments)
+                # The LLM occasionally outputs malformed JSON for tool arguments
+                # (especially when content is very long, e.g. trying to dump a
+                # whole file into write_file's `content`). Don't crash the run
+                # — surface the parse error as a synthetic tool call so the
+                # downstream tool dispatcher can return an error message to
+                # the LLM and let it retry with valid arguments.
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError as e:
+                    args = {
+                        "_parse_error": (
+                            f"JSON decode failed at position {e.pos}: {e.msg}. "
+                            f"raw arguments length={len(tc.function.arguments)}"
+                        )
+                    }
                 tool_calls.append({
                     "name": tc.function.name,
                     "args": args,

@@ -43,3 +43,11 @@ FACT_INITIAL_CONFIDENCE = 0.0
 FACT_REINFORCE_DELTA = 0.2
 FACT_MAX_CONFIDENCE = 1.0
 FACT_GRACE_PERIOD_TASKS = 5
+
+# Global facts files (used by benchmark runners for cross-instance fact sharing).
+# When MemoryManager is initialized with global_facts_file=this path, facts are
+# read/written here instead of the per-instance memory.json. task_history and
+# project_context still go to per-instance memory.json so each instance can be
+# inspected independently.
+MBPP_GLOBAL_FACTS_FILE = f"{WORKSHOP}/mbpp_global_facts.json"
+SWEBENCH_GLOBAL_FACTS_FILE = f"{WORKSHOP}/swebench_global_facts.json"

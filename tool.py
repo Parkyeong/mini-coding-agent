@@ -119,17 +119,40 @@ def search_in_files(keyword:str, dir_path:str = ".") -> str:
 def replace_in_file(file_path:str, old_text:str, new_text:str) -> str:
     "replace text in file, instead of write whole content"
     try:
+        # Guard: empty old_text is dangerous because Python's str.replace("", x)
+        # inserts x between every two characters, which has destroyed
+        # test_solution.py in past benchmark runs (mbpp_0602 grew to 2281 lines).
+        # If the LLM wants to write a file from scratch, it should use write_file.
+        if old_text == "":
+            return (
+                "Error: old_text cannot be empty. "
+                "Use write_file to create or fully overwrite a file. "
+                "Use replace_in_file only for targeted edits inside an existing file."
+            )
+
         path = safe_path(file_path)
         with open(path, 'r', encoding='utf-8') as f:
             content = f.read()
 
         if old_text not in content:
             return f"'{old_text}' not found in file."
-        updated = content.replace(old_text, new_text) #替换具体哪个地方需要后续优化
+
+        # Guard: also catch ambiguous matches (multiple occurrences) to avoid
+        # accidentally rewriting all of them when LLM only wanted one.
+        occurrences = content.count(old_text)
+        if occurrences > 1:
+            return (
+                f"Error: '{old_text}' appears {occurrences} times in {path}. "
+                f"replace_in_file requires a unique match. "
+                f"Provide more surrounding context in old_text to make it unique, "
+                f"or use write_file to rewrite the whole file."
+            )
+
+        updated = content.replace(old_text, new_text)
         with open(path,'w', encoding='utf-8') as f:
             f.write(updated)
             _record_file_change(file_path)
-            
+
         return f"'{old_text}' replaced with '{new_text}' in {path} successfully"
     except FileNotFoundError:
         return "File not found"
@@ -181,13 +204,23 @@ TOOL_DEFINITIONS = [
          "required": ["dir_path", "keyword"]}
     },
     {"name": "replace_in_file",
-     "description": "Replace text in a file.",
+     "description": (
+         "Replace one specific occurrence of old_text with new_text in a file. "
+         "Use this for small targeted edits inside an existing file. "
+         "RULES: (1) old_text MUST appear EXACTLY ONCE in the file — include "
+         "enough surrounding context to make it unique. (2) old_text cannot be "
+         "empty (use write_file to create new files). (3) Make sure old_text and "
+         "new_text are syntactically self-contained — if old_text ends with `:` "
+         "then new_text must also end with `:`, otherwise you will end up with "
+         "double colons or missing colons. (4) If you need to rewrite an entire "
+         "file or create a new one, use write_file instead."
+     ),
      "parameters": {
          "type": "object",
          "properties": {
-             "file_path": {"type": "string", "description": "The path to the file in which to replace text."},
-             "old_text": {"type": "string", "description": "The text to be replaced."},
-             "new_text": {"type": "string", "description": "The text to replace with."}},
+             "file_path": {"type": "string", "description": "The path to the file to edit."},
+             "old_text": {"type": "string", "description": "The exact text to be replaced. Must appear exactly once in the file."},
+             "new_text": {"type": "string", "description": "The replacement text. Must be syntactically consistent with old_text (matching colons, parentheses, etc.)."}},
          "required": ["file_path", "old_text", "new_text"]}
     },
     {
@@ -241,11 +274,35 @@ def execute_tool(tool_name, input_data):
         "replace_in_file": replace_in_file,
         "save_memory": save_memory
     }
-    
-    if tool_name in tool_mapping:
-        return tool_mapping[tool_name](**input_data)
-    else:
+
+    if tool_name not in tool_mapping:
         return f"Tool '{tool_name}' not found."
+
+    # llm.py wraps JSON parse errors as {"_parse_error": "..."} in input_data
+    # so the LLM gets a clear error and can retry with valid arguments.
+    if isinstance(input_data, dict) and "_parse_error" in input_data:
+        return (
+            f"Error: tool arguments could not be parsed as JSON. "
+            f"{input_data['_parse_error']}. "
+            f"This usually happens when the content field is very long or contains "
+            f"unescaped quotes/newlines. Try a shorter or properly escaped payload."
+        )
+
+    # Wrap the actual call so that bad LLM input (wrong arg name, wrong type,
+    # malformed payload, etc.) becomes a string error returned to the LLM
+    # instead of crashing the whole agent run. The LLM can then read the error
+    # and self-correct on the next step.
+    try:
+        return tool_mapping[tool_name](**input_data)
+    except TypeError as e:
+        # Wrong / unexpected keyword arguments. Tell the LLM what the tool
+        # actually accepts so it can fix its next call.
+        return (
+            f"Error calling {tool_name}: {e}. "
+            f"Check the tool's parameter names and types in the tool definition."
+        )
+    except Exception as e:
+        return f"Error calling {tool_name}: {type(e).__name__}: {e}"
 
 
 def set_memory_manager(manager):
