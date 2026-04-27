@@ -290,7 +290,8 @@
           <div class="k">文件</div><div class="v"><span class="pill">main.py</span></div>
           <div class="k">函数</div><div class="v"><span class="pill">main()</span></div>
           <div class="k">关键代码</div><div class="v"><span class="pill">user_input = input("\n User:").strip()</span></div>
-          <div class="k">下一跳</div><div class="v"><span class="pill">run_task(user_input, planner, coder, verifier, memory, metrics)</span></div>
+          <div class="k">下一跳</div><div class="v"><span class="pill">run_task(user_input, planner, coder, memory, metrics)</span></div>
+          <div class="k">说明</div><div class="v">verifier 不再是 Agent,是一个纯 pytest 函数(verifier.verify(memory)),所以不出现在参数列表里</div>
         </div>
       </div>
     </div>
@@ -337,15 +338,16 @@
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">调用链</div><div class="v"><span class="pill">planner.create_plan</span> → <span class="pill">BaseAgent.run</span> → <span class="pill red">llm.chat</span></div>
+          <div class="k">调用链</div><div class="v"><span class="pill">planner_role.create_plan(agent, ...)</span> → <span class="pill">Agent.run</span> → <span class="pill red">llm.chat</span></div>
           <div class="k">输入</div><div class="v">
             <span class="pill">user_task</span>
             <span class="pill">memory_context</span>
             <span class="pill">failure_context</span>
           </div>
-          <div class="k">特点</div><div class="v">Planner 不带 tools,<span class="pill">max_steps = 1</span> —— 一次 LLM 调用直接出 plan</div>
+          <div class="k">特点</div><div class="v">planner Agent 不带 tools,<span class="pill">max_steps = 1</span> —— 一次 LLM 调用直接出 plan,然后 <span class="pill purple">parse_plan(text)</span> 拆成 list</div>
           <div class="k">输出</div><div class="v"><span class="pill green">plan_steps: list[str]</span></div>
           <div class="k">写回</div><div class="v"><span class="pill purple">working.set_plan(plan_steps)</span></div>
+          <div class="k">注意</div><div class="v">planner / coder / verifier 不再是 BaseAgent 的子类,而是同一个 <span class="pill">Agent</span> 类的不同实例(role / system_prompt / tools 是构造参数)</div>
         </div>
       </div>
     </div>
@@ -376,19 +378,20 @@
       <div class="step-header">
         <div>
           <p class="title">5. Coder 执行当前 step</p>
-          <p class="summary">Coder 继承 BaseAgent.run(),区别是它带工具,可以进入 tool-calling loop。每次 run 之前先注入 working memory snapshot。</p>
+          <p class="summary">coder 是带工具的 Agent 实例,跑 ReAct loop。每次启动前先把 working memory snapshot 拼到 prompt 前面,让它知道前面 step 学到了什么。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">调用链</div><div class="v"><span class="pill">coder.reset_message()</span> → <span class="pill">coder.run(current_step)</span></div>
-          <div class="k">注入 snapshot</div><div class="v"><span class="pill purple">memory.get_working().snapshot_for_coder()</span> 拼到 user 消息前面</div>
-          <div class="k">LLM loop</div><div class="v"><span class="pill">BaseAgent.run()</span> 内部循环最多 <code>MAX_STEPS=8</code> 步,每步 <span class="pill red">llm.chat()</span> + tool 调用</div>
-          <div class="k">tool 副作用</div><div class="v">
-            <span class="pill green">read_file → _record_observation</span>
-            <span class="pill green">write_file → _record_file_change</span>
-            <span class="pill green">save_memory → wm.add_candidate_fact</span>
+          <div class="k">调用链</div><div class="v"><span class="pill">coder_role.run_coder(coder, step, memory)</span> → <span class="pill">Agent.run</span></div>
+          <div class="k">注入 snapshot</div><div class="v"><span class="pill purple">memory.get_working().snapshot_for_coder()</span> 拼到 user 消息前面 — 包含 plan / 之前 step 的 observations / files_changed</div>
+          <div class="k">LLM loop</div><div class="v"><span class="pill">Agent.run()</span> 内部循环最多 <code>MAX_STEPS=8</code> 步,每步 <span class="pill red">llm.chat()</span> → 解析 tool_calls → <span class="pill">execute_tool(name, args, env, memory)</span></div>
+          <div class="k">tool 调度</div><div class="v">tool 函数纯净,只依赖 <span class="pill">Environment</span> 和(对 save_memory 而言)memory,不写 working memory</div>
+          <div class="k">事件落地</div><div class="v">每次 LLM 往返 / tool_call / tool_result / final text 都由 Agent loop push 到 <span class="pill purple">working.event_log</span></div>
+          <div class="k">派生视图</div><div class="v">
+            <span class="pill green">working.observations() — 由 event_log 中的 read_file/list_dir tool_result 派生</span>
+            <span class="pill green">working.files_changed — 由 event_log 中的 write_file/replace_in_file 派生</span>
           </div>
           <div class="k">输出</div><div class="v"><span class="pill">{text, completed}</span></div>
         </div>
@@ -400,18 +403,19 @@
     <div class="step">
       <div class="step-header">
         <div>
-          <p class="title">6. Verifier 真跑测试 + 判定</p>
-          <p class="summary">verifier 先从 memory 拿 test_command 真跑一遍,把 returncode/stdout/stderr 作为 [TestRunner] block 喂给 LLM 做综合判定。</p>
+          <p class="title">6. Verifier 跑 pytest(纯函数,不调 LLM)</p>
+          <p class="summary">verifier 不再是 Agent,是一个纯函数。从 memory 拿 test_command,subprocess 跑 pytest,看 returncode 直接出结论。失败时把 stderr 末尾喂给 coder 重试。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">调用</div><div class="v"><span class="pill">verifier.verify(user_prompt, step_desc, coder_result, files_changed)</span></div>
-          <div class="k">真跑测试</div><div class="v"><span class="pill purple">_maybe_run_test()</span> → <span class="pill green">test_runner.run_tests()</span> → <span class="pill green">SubprocessRunner.run()</span></div>
-          <div class="k">test_command</div><div class="v">3 级 fallback: <span class="pill">memory</span> → <span class="pill orange">marker</span> → <span class="pill red">skip</span></div>
-          <div class="k">LLM 判定</div><div class="v">verifier 把 [TestRunner] block + coder 自报 + files_changed 一起喂给 LLM,要求 <code>STATUS: PASSED|FAILED</code></div>
-          <div class="k">输出</div><div class="v"><span class="pill">{passed, reason, fix_suggestion}</span></div>
+          <div class="k">调用</div><div class="v"><span class="pill">verifier.verify(memory)</span> — 签名极简,只要 memory</div>
+          <div class="k">真跑测试</div><div class="v"><span class="pill purple">maybe_run_test(memory)</span> → <span class="pill green">test_runner.run_tests()</span> → <span class="pill green">SubprocessRunner.run()</span></div>
+          <div class="k">test_command</div><div class="v">3 级 fallback: <span class="pill">memory.project_context.test_command</span> → <span class="pill orange">marker(pytest.ini/pyproject.toml/tests/)</span> → <span class="pill red">skip</span></div>
+          <div class="k">判定</div><div class="v"><span class="pill green">result.passed()</span> = <code>executed AND not timed_out AND returncode == 0</code> — 没有 LLM 介入</div>
+          <div class="k">挂掉时</div><div class="v"><span class="pill orange">fix_suggestion = (stderr 或 stdout)[-1500:]</span> — pytest 失败堆栈末尾,喂给 coder 下一轮重试</div>
+          <div class="k">输出</div><div class="v"><span class="pill">{passed, reason, fix_suggestion, test_block}</span></div>
         </div>
       </div>
     </div>
@@ -429,9 +433,10 @@
       <div class="step-body">
         <div class="kv">
           <div class="k">PASSED</div><div class="v"><span class="pill green">step_passed = True</span> → break inner retry loop</div>
-          <div class="k">FAILED</div><div class="v">把 reason / fix_suggestion 拼到 current_step,再 retry 一次</div>
-          <div class="k">retry 用尽</div><div class="v"><span class="pill orange">_build_failure_context()</span> 生成给 planner 看的失败摘要 → break inner step loop → 触发 replan</div>
+          <div class="k">FAILED (反馈层 1)</div><div class="v">把 <span class="pill">reason</span> + <span class="pill orange">fix_suggestion (pytest stderr 末尾)</span> 拼到 current_step,coder 下一轮直接看到失败堆栈</div>
+          <div class="k">retry 用尽 (反馈层 2)</div><div class="v"><span class="pill orange">_build_failure_context(plan, failed_step_idx, error_history)</span> 生成给 planner 看的完整失败史 → break step loop → 进入下一轮 replan</div>
           <div class="k">replan 用尽</div><div class="v"><span class="pill red">overall_passed = False</span> → 返回 "Task failed"</div>
+          <div class="k">总结</div><div class="v">两层反馈循环: <span class="pill">step retry</span>(coder 看 verifier 反馈) + <span class="pill">plan replan</span>(planner 看完整失败史)</div>
         </div>
       </div>
     </div>
@@ -535,21 +540,22 @@
   ]
 }</code></pre>
 
-    <h3>setup_mbpp.py 流程</h3>
-    <p class="lead">为每条题目 materialize 一个独立的 workspace。</p>
+    <h3>mbpp_task.py 流程(单文件 runner: setup + run + report)</h3>
+    <p class="lead">三个子命令: <span class="pill">setup</span> 物化 case → <span class="pill">run</span> 跑 agent → <span class="pill">all</span> 一条命令搞完。所有 artefact 落在 <code>Execution/&lt;exp_name&gt;/</code>,每次实验自包含。</p>
 
     <div class="step open">
       <div class="step-header">
         <div>
-          <p class="title">1. 加载数据集</p>
-          <p class="summary">用 datasets 库拉 sanitized subset。</p>
+          <p class="title">1. setup: 加载数据集 + 物化 case</p>
+          <p class="summary">从 HuggingFace 拉 MBPP,为每条题写出独立 workspace。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">命令</div><div class="v"><span class="pill">python -m runners.setup_mbpp --split test --limit 3</span></div>
-          <div class="k">代码</div><div class="v"><span class="pill">load_dataset("google-research-datasets/mbpp", "sanitized", split="test")</span></div>
+          <div class="k">命令</div><div class="v"><span class="pill">python -m runners.mbpp_task setup --exp baseline --subset sanitized --split test --limit 10</span></div>
+          <div class="k">subset</div><div class="v"><span class="pill">sanitized</span> (默认,427 条人工清洗) 或 <span class="pill">full</span> (974 条原始)</div>
+          <div class="k">数据集字段</div><div class="v">sanitized 用 <code>prompt</code>,full 用 <code>text</code>,代码自动判断</div>
           <div class="k">缓存</div><div class="v">第一次下载到 <code>~/.cache/huggingface/datasets/</code>,后续秒读</div>
         </div>
       </div>
@@ -559,18 +565,18 @@
     <div class="step">
       <div class="step-header">
         <div>
-          <p class="title">2. materialize_instance:为每条题写出 4 个文件</p>
+          <p class="title">2. materialize_instance: 为每条题写出 4 个文件</p>
           <p class="summary">workspace + solution.py + test_solution.py + prompt.md + memory.json</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">workspace</div><div class="v"><span class="pill">os.makedirs("Execution/mbpp_{task_id:04d}")</span></div>
+          <div class="k">workspace</div><div class="v"><span class="pill">Execution/&lt;exp&gt;/single_case_details/mbpp_{task_id:04d}/</span></div>
           <div class="k">solution.py</div><div class="v">空 stub,等 agent 填代码</div>
           <div class="k">test_solution.py</div><div class="v"><code>from solution import *</code> + 把 test_list 包成 <code>def test_case_N():</code> 函数</div>
           <div class="k">prompt.md</div><div class="v">MBPP 描述 + <b>展示 test_list</b> 给 agent 看(否则 agent 猜不到函数名)</div>
-          <div class="k">memory.json</div><div class="v"><b>预填 test_command</b>: <code>"pytest -q test_solution.py"</code></div>
+          <div class="k">memory.json</div><div class="v"><b>预填 test_command</b>: <code>"pytest -q test_solution.py"</code> + project_context</div>
         </div>
       </div>
     </div>
@@ -579,42 +585,43 @@
     <div class="step">
       <div class="step-header">
         <div>
-          <p class="title">3. 生成的目录结构</p>
-          <p class="summary">每条 instance 一个独立 workspace,run_mbpp.py 之后扫这些文件夹跑批。</p>
+          <p class="title">3. 实验目录布局(自包含)</p>
+          <p class="summary">每个实验 = 一个文件夹,删一个文件夹整个实验就没了,可复现。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
 <pre><code>Execution/
-├── mbpp_global_facts.json    # 跨 instance 共享的 facts(双轨)
-├── mbpp_0011/
-│   ├── solution.py           # 空 stub
-│   ├── test_solution.py      # pytest harness
-│   ├── prompt.md             # 描述 + test 案例
-│   └── memory.json           # project_context + task_history
-├── mbpp_0012/
-│   └── ...
-└── mbpp_0013/
-    └── ...</code></pre>
+└── &lt;exp_name&gt;/                          # 比如 baseline
+    ├── single_case_details/             # 所有 case workspace
+    │   ├── mbpp_0011/
+    │   │   ├── solution.py              # 空 stub
+    │   │   ├── test_solution.py         # pytest harness
+    │   │   ├── prompt.md                # 描述 + test 案例
+    │   │   └── memory.json              # project_context + task_history
+    │   ├── mbpp_0012/
+    │   └── ...
+    ├── mbpp_global_facts.json           # 这次实验的累积 facts
+    └── mbpp_exp_final_results.json      # 结构化 report</code></pre>
       </div>
     </div>
 
-    <h3>run_mbpp.py 流程</h3>
-    <p class="lead">扫 workspaces,逐条切 config.WORKSPACE,调 run_task,生成 mbpp_report.json。</p>
+    <h3>run 子命令流程</h3>
+    <p class="lead">扫 <code>&lt;exp&gt;/single_case_details/mbpp_*</code>,逐条切 config.WORKSPACE,调 main.run_task,把 report 写到实验目录。</p>
 
     <div class="step">
       <div class="step-header">
         <div>
           <p class="title">1. 扫描 workspaces</p>
-          <p class="summary">用 glob 找出所有 mbpp_xxxx 文件夹。</p>
+          <p class="summary">用 glob 找出实验目录下所有 mbpp_xxxx 文件夹。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">命令</div><div class="v"><span class="pill">python -m runners.run_mbpp --limit 3</span></div>
-          <div class="k">扫描</div><div class="v"><span class="pill">sorted(glob("Execution/mbpp_*"))[:limit]</span></div>
-          <div class="k">关键</div><div class="v">扫到几个跑几个,setup 阶段写了什么 split,这里就跑什么 split</div>
+          <div class="k">命令</div><div class="v"><span class="pill">python -m runners.mbpp_task run --exp baseline [--limit N]</span></div>
+          <div class="k">扫描</div><div class="v"><span class="pill">sorted(glob("Execution/&lt;exp&gt;/single_case_details/mbpp_*"))[:limit]</span></div>
+          <div class="k">关键</div><div class="v">扫到几个跑几个,setup 阶段物化了什么这里就跑什么</div>
         </div>
       </div>
     </div>
@@ -624,15 +631,15 @@
       <div class="step-header">
         <div>
           <p class="title">2. 切换全局 WORKSPACE</p>
-          <p class="summary">每条 instance 跑之前 mutate config.WORKSPACE,让 tool.py 动态读到正确路径。</p>
+          <p class="summary">每条 instance 跑之前 mutate config.WORKSPACE,让 environment / verifier / tools 都看到正确路径。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
           <div class="k">代码</div><div class="v"><span class="pill warn">config_module.WORKSPACE = workspace</span></div>
-          <div class="k">为什么</div><div class="v">tool.py 用 <code>import config</code> + <code>config.WORKSPACE</code>,运行时切换才能生效</div>
-          <div class="k">如果忘了改</div><div class="v"><span class="pill red">tool 操作会写到错的 workspace</span></div>
+          <div class="k">为什么</div><div class="v">verifier 跑 pytest 时读 <code>config.WORKSPACE</code>,运行时切换才能让每个 case 在自己的 workspace 里跑</div>
+          <div class="k">env 实例</div><div class="v"><span class="pill">Environment(workspace, command_timeout=...)</span> 也是 per-instance new</div>
         </div>
       </div>
     </div>
@@ -641,16 +648,17 @@
     <div class="step">
       <div class="step-header">
         <div>
-          <p class="title">3. 双轨 MemoryManager</p>
-          <p class="summary">实例化时传 global_facts_file,启用双文件模式。</p>
+          <p class="title">3. 双轨 MemoryManager (per-experiment)</p>
+          <p class="summary">实例化时传 global_facts_file 指向实验目录下的 facts 文件,启用双文件模式。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">代码</div><div class="v"><span class="pill purple">MemoryManager(memory_file=ws/memory.json, global_facts_file=MBPP_GLOBAL_FACTS_FILE)</span></div>
+          <div class="k">代码</div><div class="v"><span class="pill purple">MemoryManager(memory_file=ws/memory.json, global_facts_file=&lt;exp&gt;/mbpp_global_facts.json)</span></div>
           <div class="k">_load() 行为</div><div class="v">先读 per-instance 拿 project_context + task_history,再读 global file 覆盖 self.data["facts"]</div>
-          <div class="k">效果</div><div class="v">这条 instance 启动时<b>能看到所有前面 instance 留下的 facts</b></div>
+          <div class="k">效果</div><div class="v">这条 instance 启动时<b>能看到本次实验内所有前面 instance 留下的 facts</b>(不同实验之间互不影响)</div>
+          <div class="k">v3 → v4 区别</div><div class="v">facts 文件不再是 config 常量,而是 per-experiment 路径,runner 直接拼出来</div>
         </div>
       </div>
     </div>
@@ -659,17 +667,17 @@
     <div class="step">
       <div class="step-header">
         <div>
-          <p class="title">4. 复用 main 流程跑 task</p>
-          <p class="summary">实例化 sub-agents,然后调 run_task 跟 main.py 完全一样。</p>
+          <p class="title">4. 复用 main.run_task</p>
+          <p class="summary">用 build_agents 一次性建好 planner + coder,然后调 run_task 跟 interactive main 完全一样。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">实例化</div><div class="v"><span class="pill">planner / coder / verifier / metrics</span> 每条 instance 重新 new</div>
-          <div class="k">注入 memory</div><div class="v"><span class="pill">tool.set_memory_manager(memory)</span></div>
+          <div class="k">实例化</div><div class="v"><span class="pill">planner, coder = build_agents(env, memory, metrics)</span> — verifier 不再是 Agent</div>
           <div class="k">prompt</div><div class="v">从 <code>workspace/prompt.md</code> 读出来作为 user_prompt</div>
-          <div class="k">调用</div><div class="v"><span class="pill">run_task(prompt, planner, coder, verifier, memory, metrics)</span></div>
+          <div class="k">调用</div><div class="v"><span class="pill">run_task(prompt, planner, coder, memory, metrics)</span> — 注意签名没有 verifier</div>
+          <div class="k">tool 注入</div><div class="v">不再需要 <code>tool.set_memory_manager()</code> — tool dispatcher 直接接收 env / memory 作为参数</div>
         </div>
       </div>
     </div>
@@ -679,19 +687,21 @@
       <div class="step-header">
         <div>
           <p class="title">5. end_task 双轨 save + 汇总报告</p>
-          <p class="summary">_save() 自动判断模式,facts 写 global,其余写 per-instance。所有 instance 跑完后输出 mbpp_report.json。</p>
+          <p class="summary">_save() 自动判断模式,facts 写 per-experiment 的 global file,其余写 per-instance。所有 instance 跑完后输出结构化 mbpp_exp_final_results.json。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">passed=True</div><div class="v">candidate facts → _promote_fact() → 写到 global file</div>
+          <div class="k">passed=True</div><div class="v">candidate facts → _promote_fact() → 写到 <code>&lt;exp&gt;/mbpp_global_facts.json</code></div>
           <div class="k">passed=False</div><div class="v">candidate facts 全部丢弃,task_history 仍然记录</div>
           <div class="k">报告状态</div><div class="v">
             <span class="pill green">passed</span>
             <span class="pill orange">failed (LLM 答错)</span>
             <span class="pill red">crashed (tool/系统错,要修代码)</span>
           </div>
+          <div class="k">报告结构</div><div class="v"><code>{experiment, model, started_at, finished_at, totals: {total/passed/failed/crashed/other}, results: [...]}</code></div>
+          <div class="k">落点</div><div class="v"><span class="pill">Execution/&lt;exp&gt;/mbpp_exp_final_results.json</span></div>
         </div>
       </div>
     </div>
@@ -708,14 +718,14 @@
       <thead><tr><th>存储</th><th>内容</th><th>目的</th></tr></thead>
       <tbody>
         <tr>
-          <td><code>Execution/mbpp_xxxx/memory.json</code></td>
+          <td><code>Execution/&lt;exp&gt;/single_case_details/mbpp_xxxx/memory.json</code></td>
           <td>project_context + task_history</td>
           <td>看每条 instance 怎么错的、为什么错(便于 debug)</td>
         </tr>
         <tr>
-          <td><code>Execution/mbpp_global_facts.json</code></td>
-          <td>所有 instance 共享的 facts</td>
-          <td>让 reinforce 真的能跨 instance 发生</td>
+          <td><code>Execution/&lt;exp&gt;/mbpp_global_facts.json</code></td>
+          <td>本次实验内所有 instance 共享的 facts</td>
+          <td>让 reinforce 真的能跨 instance 发生 (不同 exp 之间隔离)</td>
         </tr>
       </tbody>
     </table>
@@ -758,43 +768,28 @@
       比 MBPP 严格得多 — agent 不仅要修对 bug,还不能破坏已有功能。
     </div>
 
-    <h3>P2 待新增的两个文件</h3>
+    <h3>P2 待新增的文件</h3>
 
     <div class="step">
       <div class="step-header">
         <div>
-          <p class="title">runners/setup_swebench.py</p>
-          <p class="summary">为每条 instance clone repo + checkout base_commit + pull docker 镜像 + 写 .agent_memory.json</p>
+          <p class="title">runners/swebench_task.py (单文件,跟 mbpp_task.py 同结构)</p>
+          <p class="summary">三个子命令: setup (clone repo + checkout + pull docker 镜像 + 写 memory.json) / run (跑 agent + rolling docker rmi) / all。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
           <div class="k">数据加载</div><div class="v"><span class="pill">load_dataset("princeton-nlp/SWE-bench_Verified", split="test")</span></div>
-          <div class="k">git clone</div><div class="v"><span class="pill">subprocess.run("git clone https://github.com/{repo}.git ws/")</span></div>
-          <div class="k">checkout</div><div class="v"><span class="pill">git -C ws checkout base_commit</span></div>
-          <div class="k">docker pull</div><div class="v"><span class="pill">docker pull swebench/sweb.eval.x86_64.{instance_id}:latest</span></div>
+          <div class="k">setup 阶段</div><div class="v">
+            <span class="pill">git clone https://github.com/{repo}.git &lt;exp&gt;/single_case_details/{instance_id}/</span>
+            <span class="pill">git checkout base_commit</span>
+            <span class="pill">docker pull swebench/sweb.eval.x86_64.{instance_id}:latest</span>
+          </div>
           <div class="k">test_command</div><div class="v">把 <code>docker run --rm -v ws:/testbed image bash -c "..."</code> 整段塞到 memory 的 test_command 字段</div>
-          <div class="k">memory 文件名</div><div class="v"><span class="pill orange">.agent_memory.json</span> 加点前缀避免跟 repo 里 memory.json 冲突</div>
-        </div>
-      </div>
-    </div>
-    <div class="arrow-down">↓</div>
-
-    <div class="step">
-      <div class="step-header">
-        <div>
-          <p class="title">runners/run_swebench.py</p>
-          <p class="summary">跟 run_mbpp.py 类似的 for 循环 + rolling 模式镜像清理。</p>
-        </div>
-        <div class="toggle"></div>
-      </div>
-      <div class="step-body">
-        <div class="kv">
-          <div class="k">扫描</div><div class="v"><span class="pill">glob("Execution/&lt;repo&gt;__&lt;repo&gt;-*")</span></div>
-          <div class="k">复用 main 流程</div><div class="v">同样调 <code>run_task()</code>,verifier 拿到 docker test_command 后 SubprocessRunner 直接跑</div>
+          <div class="k">run 阶段</div><div class="v">扫 <code>&lt;exp&gt;/single_case_details/*</code>,逐条 mutate config.WORKSPACE,调 <code>run_task()</code>,verifier 拿到 docker test_command 后 SubprocessRunner 直接跑</div>
           <div class="k">rolling cleanup</div><div class="v">每条跑完后 <span class="pill">docker rmi</span> 删掉这条 instance 的镜像,节省磁盘</div>
-          <div class="k">global facts</div><div class="v"><span class="pill purple">SWEBENCH_GLOBAL_FACTS_FILE</span> 跟 MBPP 分开</div>
+          <div class="k">实验目录</div><div class="v">跟 MBPP 一样: <code>Execution/&lt;exp&gt;/{single_case_details, swebench_global_facts.json, swebench_exp_final_results.json}</code></div>
         </div>
       </div>
     </div>

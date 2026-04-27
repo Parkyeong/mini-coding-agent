@@ -1,10 +1,13 @@
 """
 Two-layer memory:
 
-- Working memory: created per task, discarded after end_task; holds candidate facts.
+- Working memory: created per task, discarded after end_task. Holds the
+  task-level event_log (every tool call/result during this task), the plan,
+  and candidate facts. observations / files_changed are *derived* from the
+  event_log, not stored directly.
 
-- MemoryManager (long-term memory): Only candidate facts that passed the tasks
-  are stored here, with confidence scores.
+- MemoryManager (long-term memory): Only candidate facts that passed the
+  tasks are stored here, with confidence scores.
 """
 
 import os
@@ -27,45 +30,99 @@ from config import (
 
 
 # ---------------------------------------------------------------------------
+# Event Log — first-class event stream for one task
+# ---------------------------------------------------------------------------
+
+class EventLog:
+    """Append-only log of mechanical events produced by the agent loop.
+
+    Event kinds (current):
+      - llm_call:    {role, input_tokens, output_tokens, latency}
+      - text:        {content}
+      - tool_call:   {name, args}
+      - tool_result: {name, args, result}
+
+    WorkingMemory derives observations / files_changed from this stream;
+    metrics and debug logs can subscribe later without changing producers.
+    """
+
+    def __init__(self):
+        self.events: list[dict] = []
+
+    def append(self, kind: str, payload: dict) -> None:
+        self.events.append({
+            "kind": kind,
+            "payload": payload,
+            "ts": datetime.now().isoformat(timespec="seconds"),
+        })
+
+    def filter(self, kind: str) -> list[dict]:
+        return [e for e in self.events if e["kind"] == kind]
+
+
+# ---------------------------------------------------------------------------
 # Working Memory
 # ---------------------------------------------------------------------------
+
+# Tool names that count as "looked at the workspace" (observation events).
+_OBSERVATION_TOOLS = ("read_file", "list_dir")
+
+# Tool names that mutate workspace files (file_changed events).
+_FILE_MUTATION_TOOLS = ("write_file", "replace_in_file")
+
 
 class WorkingMemory:
     def __init__(self, task_id: str, user_prompt: str):
         self.task_id = task_id
         self.user_prompt = user_prompt
+        self.event_log = EventLog()
         self.plan: list[str] = []
-        self.observations: list[dict] = []     # [{kind, content, timestamp}]
-        self.candidate_facts: list[dict] = []  # [{fact, category}]
-        self.files_changed: set[str] = set()
+        self.candidate_facts: list[dict] = []
 
     def set_plan(self, plan: list[str]) -> None:
         self.plan = list(plan)
 
-    def add_observation(self, kind: str, content: str) -> None:
-        if len(self.observations) >= MAX_WORKING_OBSERVATIONS:
-            self.observations.pop(0)
-
-        self.observations.append({
-            "kind": kind,
-            "content": content[:WORKING_OBSERVATION_MAX_CHARS],
-            "timestamp": datetime.now().isoformat(timespec='seconds'),
-        })
-
     def add_candidate_fact(self, fact: str, category: str) -> None:
         norm = _normalize_fact(fact)
-
         if any(_normalize_fact(f["fact"]) == norm for f in self.candidate_facts):
             return
-
         self.candidate_facts.append({"fact": fact, "category": category})
 
-    def add_file_changed(self, path: str) -> None:
-        self.files_changed.add(path)
+    # ------------------------------------------------------------------
+    # Derived views
+    # ------------------------------------------------------------------
+
+    @property
+    def files_changed(self) -> set[str]:
+        paths = set()
+        for e in self.event_log.filter("tool_result"):
+            payload = e["payload"]
+            if payload["name"] not in _FILE_MUTATION_TOOLS:
+                continue
+            fp = payload.get("args", {}).get("file_path")
+            if fp:
+                paths.add(fp)
+        return paths
+
+    def observations(self) -> list[dict]:
+        obs = []
+        for e in self.event_log.filter("tool_result"):
+            payload = e["payload"]
+            name = payload["name"]
+            if name not in _OBSERVATION_TOOLS:
+                continue
+            args = payload.get("args", {})
+            result = (payload.get("result") or "")[:200]
+            if name == "read_file":
+                content = f"{args.get('file_path')}: {result}"
+            else:  # list_dir
+                content = f"{args.get('dir_path', '.')}: {result}"
+            obs.append({"kind": name, "content": content[:WORKING_OBSERVATION_MAX_CHARS]})
+        return obs
 
     def snapshot_for_coder(self) -> str:
-        """Format the current working memory into a string block for coder input."""
-        if not self.observations and not self.plan:
+        observations = self.observations()
+        if not observations and not self.plan:
             return "No observations or plan yet."
 
         parts = [f"[WorkingMemory] task_id = {self.task_id} "]
@@ -74,13 +131,14 @@ class WorkingMemory:
             for i, step in enumerate(self.plan, 1):
                 parts.append(f" - {i}. {step}")
 
-        if self.observations:
+        if observations:
             parts.append("Recent observations from earlier steps:")
-            for obs in self.observations[-10:]:
+            for obs in observations[-MAX_WORKING_OBSERVATIONS:][-10:]:
                 parts.append(f" - [{obs['kind']}] {obs['content']}")
 
-        if self.files_changed:
-            parts.append(f"Files changed so far: {sorted(self.files_changed)}")
+        files_changed = self.files_changed
+        if files_changed:
+            parts.append(f"Files changed so far: {sorted(files_changed)}")
 
         return "\n".join(parts)
 
@@ -129,43 +187,34 @@ class MemoryManager:
         self._working: Optional[WorkingMemory] = None
 
     def _load(self) -> dict:
-        # Always load per-instance file first (or default if missing)
         if os.path.exists(self.memory_file):
             with open(self.memory_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         else:
             data = self._default_data()
 
-        # Dual-file mode: facts come from the shared global file, overriding
-        # whatever facts (probably empty) sit in the per-instance file.
         if self.global_facts_file is not None:
             data["facts"] = self._load_global_facts()
 
         return data
 
     def _load_global_facts(self) -> list:
-        """Read the shared facts file. Returns [] if it doesn't exist yet."""
         if not os.path.exists(self.global_facts_file):
             return []
         with open(self.global_facts_file, 'r', encoding='utf-8') as f:
             payload = json.load(f)
-        # Tolerate either {"facts": [...]} or just [...] at the top level
         if isinstance(payload, dict):
             return payload.get("facts", [])
         return payload
 
     def _save(self) -> None:
         if self.global_facts_file is not None:
-            # Dual-file mode: write facts to global, everything else to per-instance
             self._save_global_facts(self.data["facts"])
             per_instance = {k: v for k, v in self.data.items() if k != "facts"}
-            # Keep an empty "facts" key in per-instance file so its schema is
-            # still valid if anything reads it directly.
             per_instance["facts"] = []
             with open(self.memory_file, 'w', encoding='utf-8') as f:
                 json.dump(per_instance, f, indent=2, ensure_ascii=False)
         else:
-            # Single-file mode: original behavior
             with open(self.memory_file, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
 
@@ -194,9 +243,7 @@ class MemoryManager:
             "facts": [],
         }
 
-    # project context
     def update_project_context(self, **kwargs) -> None:
-        """Update project info, e.g. language='python', test_command='pytest'."""
         self.data["project_context"].update(kwargs)
         self.data["project_context"]["updated_at"] = self._now()
         self._save()
@@ -215,8 +262,6 @@ class MemoryManager:
         wm = self._working
         files_changed = sorted(wm.files_changed) if wm else []
 
-        # Current task index (1-based): the new task we're about to record.
-        # task_history hasn't been appended yet, so this is len + 1.
         current_task_idx = len(self.data["task_history"]) + 1
 
         if passed and wm:
@@ -232,6 +277,10 @@ class MemoryManager:
             "files_changed": files_changed,
             "attempts": attempts,
             "summary": summary,
+            # Persist the per-task event stream so we can replay LLM decisions
+            # offline without rerunning. Useful for debugging — without this the
+            # event_log is discarded when working memory drops.
+            "event_log": list(wm.event_log.events) if wm else [],
         }
         if error_history:
             record["error_history"] = error_history
@@ -243,16 +292,10 @@ class MemoryManager:
 
         self._save()
 
-        # Drop working memory
         self._working = None
 
     def _promote_fact(self, fact: str, category: str,
                       source_task_id: str, current_task_idx: int) -> None:
-        """Promote a candidate fact to long-term memory.
-
-        If the fact already exists, reinforce it (confidence += delta, count += 1).
-        Otherwise insert as a new fact starting at confidence=0, count=0.
-        """
         norm = _normalize_fact(fact)
         for existing in self.data["facts"]:
             if _normalize_fact(existing["fact"]) == norm:
@@ -270,30 +313,14 @@ class MemoryManager:
             "category": category,
             "confidence": FACT_INITIAL_CONFIDENCE,
             "reinforce_count": 0,
-            "created_at_task": current_task_idx,         # used by grace period
-            "source_task_id": source_task_id,            # which task first created it
+            "created_at_task": current_task_idx,
+            "source_task_id": source_task_id,
             "created_at": self._now(),
             "last_reinforced_at": self._now(),
-            "reinforced_by": [source_task_id],           # task ids that reinforced it
+            "reinforced_by": [source_task_id],
         })
 
     def _evict_facts_if_needed(self, current_task_idx: int) -> None:
-        """
-        Evict facts when long-term exceeds MAX_MEMORY_FACTS.
-
-        Policy (two-tier sort):
-          1. Primary key: in_grace_period? (True sorts LAST = protected)
-             Facts whose age < FACT_GRACE_PERIOD_TASKS are deprioritized
-             from eviction unless we have no other choice.
-          2. Secondary key: score = confidence × reinforce_count (lowest first).
-             Within the same protection tier, the lowest score gets evicted.
-          3. Tertiary key: created_at_task (oldest first).
-             Same score → older fact had more chances, evict it first.
-
-        This is NOT a hard exemption — grace period only LOWERS eviction
-        priority. If memory pressure forces it (e.g. all facts are new),
-        the lowest-score new fact still gets evicted instead of crashing.
-        """
         def age(f):
             return current_task_idx - f.get("created_at_task", current_task_idx)
 
@@ -344,13 +371,6 @@ class MemoryManager:
         return datetime.now().isoformat(timespec='seconds')
 
     def generate_task_id(self) -> str:
-        """Generate a task_id for the next task.
-
-        Includes project_name as prefix so benchmark instances (which each
-        have their own per-instance memory.json) get distinguishable task_ids
-        instead of all becoming "0001". For long-running single-project use,
-        the prefix is still informative.
-        """
         count = len(self.data.get("task_history", []))
         project = self.data.get("project_context", {}).get("project_name", "")
         if project:

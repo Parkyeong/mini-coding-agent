@@ -1,11 +1,11 @@
-import llm
-import tool as Tools
-from metrics import MetricsTracker
-from config import ENABLE_METRICS, MAX_STEPS
-from agent import BaseAgent
+"""Coder role: prompt + working-memory snapshot injection.
 
+The actual LLM + tool loop runs in Agent. main.py constructs a coder Agent
+with PROMPT and the FS/shell tools, and calls run_coder(agent, step, memory)
+for each plan step.
+"""
 
-CODER_PROMPT = """
+PROMPT = """
 You are a professional coding agent.
 **Your scope is strictly limited to the workspace. You cannot access anything outside of the workspace.**
 
@@ -30,23 +30,21 @@ Rules:
 - Always try to verify your changes by running relevant commands.
 - In your final response: summarize what you changed, what tools you used, and verification results."""
 
-class Coder(BaseAgent):
-    def __init__(self, metrics_tracker=None, memory=None):
-        super().__init__(
-            system_prompt = CODER_PROMPT,
-            tools = Tools.get_tools(),
-            metrics_tracker = metrics_tracker,
-            agent_role = "coder"
-        )
-        self.memory = memory
 
-    def run(self, input_text:str) ->dict:
-        if self.memory is not None:
-            wm = self.memory.get_working()
-            if wm is not None:
-                snapshot = wm.snapshot_for_coder()
-                if snapshot:
-                    input_text = f"{snapshot}\n\n current step:{input_text}"
+def build_input(step: str, memory) -> str:
+    """Prepend a working-memory snapshot to the step description, so the
+    coder can see what earlier steps already learned / changed."""
+    if memory is None:
+        return step
+    wm = memory.get_working()
+    if wm is None:
+        return step
+    snapshot = wm.snapshot_for_coder()
+    if not snapshot:
+        return step
+    return f"{snapshot}\n\n current step:{step}"
 
-        return super().run(input_text)
 
+def run_coder(agent, step: str, memory) -> dict:
+    agent.reset_message()
+    return agent.run(build_input(step, memory))

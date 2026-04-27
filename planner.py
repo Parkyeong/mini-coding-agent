@@ -1,9 +1,10 @@
-import llm
-from metrics import MetricsTracker
-from config import ENABLE_METRICS
-from agent import BaseAgent
+"""Planner role: prompt + input building + output parsing.
 
-PLANNER_PROMPT = """You are a task planning expert for a coding agent.
+The actual LLM call goes through Agent. main.py constructs an Agent with
+PROMPT and calls create_plan(agent, ...) to get a list of steps.
+"""
+
+PROMPT = """You are a task planning expert for a coding agent.
 The user will give you a coding task and optionally some project context.
 
 Your job:
@@ -20,53 +21,34 @@ Example:
 4. Run tests to verify the changes work correctly."""
 
 
-class Planner(BaseAgent):
-    def __init__(self, metrics_tracker=None):
-        super().__init__(
-            system_prompt = PLANNER_PROMPT,
-            tools = [],
-            max_steps =1,
-            metrics_tracker = metrics_tracker,
-            agent_role = "planner"
-
-        )
+def build_input(user_task: str, memory_context: str = "", failure_context: str = None) -> str:
+    parts = []
+    if memory_context:
+        parts.append(f"Project Context\n{memory_context}")
+    if failure_context:
+        parts.append(f"Previous Attempt Failed\n{failure_context}")
+    parts.append(f"Task\n{user_task}")
+    return "\n\n".join(parts)
 
 
-    def create_plan(self, user_task:str,memory_context:str= "", failure_context:str=None)->list[str]:
-        """
-        Generate a plan.
-        Args:
-        - user_task: original user request
-        - memory_context: historical context from MemoryManager
-        - failure_context: if replanning, contains previous failure info
-        Return: list of step ["step1", "step2",...]
-        """
+def parse_plan(text: str) -> list[str]:
+    lines = text.strip().splitlines()
+    steps = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if len(line) > 2 and line[0].isdigit() and line[1] in ".、）)":
+            line = line[2:].strip()
+        elif len(line) > 3 and line[0].isdigit() and line[1].isdigit() and line[2] in ".、":
+            line = line[3:].strip()
+        steps.append(line)
+    return steps if steps else [text.strip()]
 
-        prompt_parts = []
-        if memory_context:
-            prompt_parts.append(f"Project Context\n{memory_context}")
-        if failure_context:
-            prompt_parts.append(f"Previous Attempt Failed\n{failure_context}")
 
-        prompt_parts.append(f"Task\n{user_task}")
-        full_prompt= "\n\n".join(prompt_parts)
-
-        self.reset_message()
-        result = self.run(full_prompt)
-        return self._parse_plan(result["text"])
-
-    def _parse_plan(self, text:str)->list[str]:
-        """Parse step list from LLM output"""
-        lines = text.strip().splitlines()
-        steps = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            if len(line) > 2 and line[0].isdigit() and line[1] in ".、）)":
-                line = line[2:].strip()
-            elif len(line) > 3 and line[0].isdigit() and line[1].isdigit() and line[2] in ".、":
-                line = line[3:].strip()
-            steps.append(line)
-
-        return steps if steps else [text.strip()]
+def create_plan(agent, user_task: str, memory_context: str = "",
+                failure_context: str = None) -> list[str]:
+    """Run the planner agent once and return parsed steps."""
+    agent.reset_message()
+    result = agent.run(build_input(user_task, memory_context, failure_context))
+    return parse_plan(result["text"])

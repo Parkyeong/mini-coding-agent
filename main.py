@@ -1,151 +1,155 @@
 import argparse
-import tool
-from config import PROVIDER, MODEL, ENABLE_METRICS, MAX_RETRIES_PER_STEPS as MAX_RETRIES_PER_STEP, MAX_REPLANS
-from planner import Planner
-from coder import Coder
-from verifier import Verifier
+
+from config import (
+    MODEL,
+    ENABLE_METRICS,
+    MAX_RETRIES_PER_STEPS as MAX_RETRIES_PER_STEP,
+    MAX_REPLANS,
+    COMMAND_TIMEOUT,
+)
+from environment import Environment
+from agent import Agent
 from memory import MemoryManager
 from metrics import MetricsTracker
+import tools as Tools
+import planner as planner_role
+import coder as coder_role
+import verifier as verifier_role
 
 
-
-def run_task(user_prompt:str, planner:Planner, coder:Coder,
-            verifier:Verifier, memory:MemoryManager,metrics:MetricsTracker=None)->str:
-    """Execute the full flow for a single task: plan -> execute -> verify -> retry/replan """
-
+def run_task(user_prompt: str, planner: Agent, coder: Agent,
+             memory: MemoryManager, metrics: MetricsTracker = None) -> str:
+    """Plan -> execute -> verify -> retry / replan, for one user task."""
     task_id = memory.generate_task_id()
-
-    working = memory.begin_task(task_id = task_id, user_prompt = user_prompt)
-
+    working = memory.begin_task(task_id=task_id, user_prompt=user_prompt)
     memory_context = memory.get_context_for_planner()
     failure_context = None
-    total_attempts= 0
-    final_plan:list[str] = []
+    total_attempts = 0
+    final_plan: list[str] = []
     overall_passed = False
+    error_history: list[dict] = []
 
-    print(f"\n{'='*50}")
-    print(f"Task[{task_id}]:{user_prompt}")
-    print(f"\n{'='*50}")
-
-
+    replans_used = 0
 
     try:
-        for replan in range(MAX_REPLANS+1):
+        for replan in range(MAX_REPLANS + 1):
             if replan > 0:
-                print(f"\n-- replan attempt {replan}/{MAX_REPLANS}--")
+                replans_used = replan
+                print(f"Replan #{replan}")
 
-            # Planning
-            print("\n[Phase: Planning]")
-            plan_steps = planner.create_plan(
-                user_task = user_prompt,
-                memory_context = memory_context,
-                failure_context = failure_context
+            plan_steps = planner_role.create_plan(
+                planner,
+                user_task=user_prompt,
+                memory_context=memory_context,
+                failure_context=failure_context,
             )
             final_plan = plan_steps
             working.set_plan(plan_steps)
+            n_steps = len(plan_steps)
+            print(f"Plan: {n_steps} steps")
 
-            for index, step in enumerate(plan_steps):
-                print(f"  Step{index+1}: {step}")
-
-            # Execution
-            print("\n[Phase: Execution]")
             all_passed = True
             error_history = []
 
             for step_idx, step_desc in enumerate(plan_steps):
-                print(f"\n ---Step {step_idx+1}/{len(plan_steps)}:{step_desc}---")
                 step_passed = False
                 current_step = step_desc
 
                 for attempt in range(MAX_RETRIES_PER_STEP):
                     total_attempts += 1
-                    if attempt > 0:
-                        print(f"Retry {attempt}/{MAX_RETRIES_PER_STEP-1}")
 
-                    # Coder Execution
-                    coder.reset_message()
-                    coder_result = coder.run(current_step)
-                    print(f"[Coder]{'completed' if coder_result['completed'] else 'max steps reached'}")
+                    coder_result = coder_role.run_coder(coder, current_step, memory)
+                    verify_result = verifier_role.verify(memory)
 
-                    # Verifier Execution
-                    verify_result = verifier.verify(
-                        user_prompt = user_prompt,
-                        step_description = step_desc,
-                        coder_result = coder_result["text"],
-                        files_changed = list(working.files_changed)
-                    )
-
-                    print(f"[Verifier]{verify_result['reason']}")
+                    attempt_tag = "" if attempt == 0 else f" (retry {attempt})"
+                    step_label = f"  step {step_idx+1}/{n_steps}"
 
                     if verify_result["passed"]:
-                        print(f"PASSED")
+                        print(f"{step_label}: PASS{attempt_tag}")
                         step_passed = True
                         break
 
-                    else:
-                        print(f"FAILED: {verify_result['fix_suggestion']}")
-                        error_history.append({
-                            "step":step_desc,
-                            "attempt":attempt+1,
-                            "reason":verify_result["reason"],
-                            "fix_suggestion":verify_result["fix_suggestion"]
-                        })
+                    will_retry = attempt < MAX_RETRIES_PER_STEP - 1
+                    retry_marker = " — retry" if will_retry else ""
+                    print(f"{step_label}: FAIL ({verify_result['reason']}){attempt_tag}{retry_marker}")
 
-                        current_step =(
-                            f"{step_desc}\n\n"
-                            f"Previous attempt failed:\n"
-                            f"Reason:{verify_result['reason']}\n"
-                            f"Fix suggestion:{verify_result['fix_suggestion']}"
-                        )
+                    error_history.append({
+                        "step": step_desc,
+                        "attempt": attempt + 1,
+                        "reason": verify_result["reason"],
+                        "fix_suggestion": verify_result["fix_suggestion"],
+                    })
+                    current_step = (
+                        f"{step_desc}\n\n"
+                        f"Previous attempt failed:\n"
+                        f"Reason:{verify_result['reason']}\n"
+                        f"Fix suggestion:{verify_result['fix_suggestion']}"
+                    )
 
                 if not step_passed:
                     all_passed = False
                     failure_context = _build_failure_context(plan_steps, step_idx, error_history)
                     break
 
-            # After all steps in this plan attempt
             if all_passed:
                 overall_passed = True
-                summary = f"Completed {len(plan_steps)} steps successfully."
+                print(f"PASSED ({total_attempts} attempts, {replans_used} replans)")
                 _print_metrics(metrics)
-                return f"Task completed successfully.\n{summary}"
+                return f"Task completed: {n_steps} steps."
 
-        # All replans exhausted
-        summary = f"Task failed after {MAX_REPLANS} replan attempts."
+        print(f"FAILED ({total_attempts} attempts, {replans_used} replans)")
         _print_metrics(metrics)
-        return summary
+        return f"Task failed after {MAX_REPLANS} replan attempts."
 
     finally:
-        # End task: promote (if passed) and record history regardless
         memory.end_task(
-            task_id = task_id,
-            passed = overall_passed,
-            plan = final_plan,
-            attempts = total_attempts,
-            summary = "Completed successfully. " if overall_passed else "Failed. See error history for details.",
-            error_history = error_history if not overall_passed else None
+            task_id=task_id,
+            passed=overall_passed,
+            plan=final_plan,
+            attempts=total_attempts,
+            summary="Completed successfully. " if overall_passed else "Failed. See error history for details.",
+            error_history=error_history if not overall_passed else None,
         )
 
-def _build_failure_context(plan:list, failed_step_idx:int, error_history:list)->str:
-    """Build failure context for Planner"""
+
+def _build_failure_context(plan: list, failed_step_idx: int, error_history: list) -> str:
     lines = [
         f"Previous plan:{plan}",
         f"Failed at step {failed_step_idx+1}:{plan[failed_step_idx]}",
         f"Attempts made:{len(error_history)}",
-        "Error details:"
+        "Error details:",
     ]
     for err in error_history[-3:]:
         lines.append(f"- Attempt {err['attempt']}:{err['reason']}")
-        if err['fix_suggestion']:
+        if err["fix_suggestion"]:
             lines.append(f"Suggestion:{err['fix_suggestion']}")
-
     return "\n".join(lines)
+
 
 def _print_metrics(metrics):
     if ENABLE_METRICS and metrics:
-        print(f"\n -- Metrics--")
         print(metrics.summary())
 
+
+def build_agents(env: Environment, memory: MemoryManager,
+                 metrics: MetricsTracker = None) -> tuple[Agent, Agent]:
+    """Build the LLM-driven roles. Verifier is a plain function (no LLM,
+    just pytest), so it isn't an Agent and isn't returned here."""
+    planner = Agent(
+        system_prompt=planner_role.PROMPT,
+        role="planner",
+        max_steps=1,
+        metrics_tracker=metrics,
+    )
+    coder = Agent(
+        system_prompt=coder_role.PROMPT,
+        role="coder",
+        tools=Tools.get_tools(),
+        env=env,
+        memory=memory,
+        metrics_tracker=metrics,
+    )
+    return planner, coder
 
 
 def main():
@@ -159,7 +163,7 @@ def main():
     from config import WORKSPACE
     print("=" * 40)
     print(f"Mini Coding Agent")
-    print(f"LLM: {PROVIDER} / {MODEL}")
+    print(f"Model: {MODEL}")
     print(f"Project: {args.project}")
     print(f"Workspace: {WORKSPACE}")
     print(f"Type 'exit' to quit.")
@@ -167,27 +171,23 @@ def main():
 
     memory = MemoryManager()
     metrics = MetricsTracker() if ENABLE_METRICS else None
+    env = Environment(WORKSPACE, command_timeout=COMMAND_TIMEOUT)
 
-    planner = Planner(metrics_tracker=metrics)
-    coder = Coder(metrics_tracker=metrics,memory=memory)
-    verifier = Verifier(metrics_tracker=metrics,memory=memory)
-
-    tool.set_memory_manager(memory)
+    planner, coder = build_agents(env, memory, metrics)
 
     while True:
         user_input = input("\n User:").strip()
-
         if not user_input:
             continue
-
         if user_input.lower() in ("exit", "quit"):
             print("Bye.")
             break
 
-        result = run_task(user_input, planner, coder, verifier, memory, metrics)
+        result = run_task(user_input, planner, coder, memory, metrics)
         print("=" * 40)
         print(f"Result: {result}")
         print("=" * 40)
+
 
 if __name__ == "__main__":
     main()
