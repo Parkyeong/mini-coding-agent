@@ -4,7 +4,7 @@ import os
 # LLM (OpenRouter)
 # ---------------------------------------------------------------------------
 # All comparison-experiment knobs live here so a single edit changes the run.
-MODEL = "openai/gpt-4.1-mini"          # OpenRouter model id, e.g. "anthropic/claude-sonnet-4"
+MODEL = "openai/gpt-4o-mini"          # OpenRouter model id, e.g. "anthropic/claude-sonnet-4"
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 BASE_URL = "https://openrouter.ai/api/v1"
 

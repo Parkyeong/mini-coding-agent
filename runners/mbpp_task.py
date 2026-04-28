@@ -255,6 +255,16 @@ def cmd_run(args) -> None:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"\nReport saved to {paths['report_file']}")
 
+    # Render dataset.html alongside the report. Failure here is non-fatal — the
+    # JSON outputs are the source of truth; rendering can always be retried via
+    # `python -m runners.render_experiment --exp <name>`.
+    try:
+        from runners.render_experiment import render_experiment
+        html_path = render_experiment(args.exp)
+        print(f"HTML report saved to {html_path}")
+    except Exception as e:
+        print(f"[warn] HTML render failed (non-fatal): {e}")
+
 
 # ---------------------------------------------------------------------------
 # all: setup + run
