@@ -149,6 +149,7 @@ def build_llm_nodes(env: Environment, memory: MemoryManager,
         system_prompt=planner_role.PROMPT,
         role="planner",
         max_steps=1,
+        memory=memory,            # so planner LLM calls also push to event_log
         metrics_tracker=metrics,
     )
     coder = LLMNode(
