@@ -1,14 +1,22 @@
-import argparse
+"""Orchestration core: plan -> execute -> verify -> retry / replan.
+
+This module IS the agent (the system) — it composes multiple LLMNode instances
+(planner, coder), the verifier function, the test_runner, and memory into a
+goal-pursuing loop. An individual LLMNode by itself isn't an "agent"; the agent
+is what this file orchestrates.
+
+This module is a library, not an entry point. Run the agent through a runner
+(e.g. `python -m runners.mbpp_task run --exp <name>`), which constructs the
+LLM nodes and calls run_task() for each task.
+"""
 
 from config import (
-    MODEL,
     ENABLE_METRICS,
     MAX_RETRIES_PER_STEPS as MAX_RETRIES_PER_STEP,
     MAX_REPLANS,
-    COMMAND_TIMEOUT,
 )
 from environment import Environment
-from agent import Agent
+from llm_node import LLMNode
 from memory import MemoryManager
 from metrics import MetricsTracker
 import tools as Tools
@@ -17,7 +25,7 @@ import coder as coder_role
 import verifier as verifier_role
 
 
-def run_task(user_prompt: str, planner: Agent, coder: Agent,
+def run_task(user_prompt: str, planner: LLMNode, coder: LLMNode,
              memory: MemoryManager, metrics: MetricsTracker = None) -> str:
     """Plan -> execute -> verify -> retry / replan, for one user task."""
     task_id = memory.generate_task_id()
@@ -59,7 +67,7 @@ def run_task(user_prompt: str, planner: Agent, coder: Agent,
                     total_attempts += 1
 
                     coder_result = coder_role.run_coder(coder, current_step, memory)
-                    verify_result = verifier_role.verify(memory)
+                    verify_result = verifier_role.verify(memory, env=coder.env)
 
                     attempt_tag = "" if attempt == 0 else f" (retry {attempt})"
                     step_label = f"  step {step_idx+1}/{n_steps}"
@@ -131,17 +139,19 @@ def _print_metrics(metrics):
         print(metrics.summary())
 
 
-def build_agents(env: Environment, memory: MemoryManager,
-                 metrics: MetricsTracker = None) -> tuple[Agent, Agent]:
-    """Build the LLM-driven roles. Verifier is a plain function (no LLM,
-    just pytest), so it isn't an Agent and isn't returned here."""
-    planner = Agent(
+def build_llm_nodes(env: Environment, memory: MemoryManager,
+                    metrics: MetricsTracker = None) -> tuple[LLMNode, LLMNode]:
+    """Build the two LLM-driven role nodes (planner + coder). Verifier is a
+    plain function (no LLM, just pytest) so it isn't an LLMNode and isn't
+    returned here. Together with verifier and the rest of the system, these
+    nodes form the agent that engine.run_task orchestrates."""
+    planner = LLMNode(
         system_prompt=planner_role.PROMPT,
         role="planner",
         max_steps=1,
         metrics_tracker=metrics,
     )
-    coder = Agent(
+    coder = LLMNode(
         system_prompt=coder_role.PROMPT,
         role="coder",
         tools=Tools.get_tools(),
@@ -150,44 +160,3 @@ def build_agents(env: Environment, memory: MemoryManager,
         metrics_tracker=metrics,
     )
     return planner, coder
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Mini Coding Agent")
-    parser.add_argument("--project", required=True, help="Project name (used as workspace folder name)")
-    args = parser.parse_args()
-
-    from config import set_project
-    set_project(args.project)
-
-    from config import WORKSPACE
-    print("=" * 40)
-    print(f"Mini Coding Agent")
-    print(f"Model: {MODEL}")
-    print(f"Project: {args.project}")
-    print(f"Workspace: {WORKSPACE}")
-    print(f"Type 'exit' to quit.")
-    print("=" * 40)
-
-    memory = MemoryManager()
-    metrics = MetricsTracker() if ENABLE_METRICS else None
-    env = Environment(WORKSPACE, command_timeout=COMMAND_TIMEOUT)
-
-    planner, coder = build_agents(env, memory, metrics)
-
-    while True:
-        user_input = input("\n User:").strip()
-        if not user_input:
-            continue
-        if user_input.lower() in ("exit", "quit"):
-            print("Bye.")
-            break
-
-        result = run_task(user_input, planner, coder, memory, metrics)
-        print("=" * 40)
-        print(f"Result: {result}")
-        print("=" * 40)
-
-
-if __name__ == "__main__":
-    main()

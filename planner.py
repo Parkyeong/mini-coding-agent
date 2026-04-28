@@ -1,7 +1,11 @@
 """Planner role: prompt + input building + output parsing.
 
-The actual LLM call goes through Agent. main.py constructs an Agent with
-PROMPT and calls create_plan(agent, ...) to get a list of steps.
+The actual LLM call goes through an LLMNode instance configured for this
+role. engine.build_llm_nodes constructs the LLMNode with PROMPT below; then
+engine.run_task calls create_plan(node, ...) to get a list of steps.
+
+This module is config + helpers, not a class. The "planner" runtime object is
+the LLMNode instance built in engine.py.
 """
 
 PROMPT = """You are a task planning expert for a coding agent.
@@ -46,9 +50,9 @@ def parse_plan(text: str) -> list[str]:
     return steps if steps else [text.strip()]
 
 
-def create_plan(agent, user_task: str, memory_context: str = "",
+def create_plan(node, user_task: str, memory_context: str = "",
                 failure_context: str = None) -> list[str]:
-    """Run the planner agent once and return parsed steps."""
-    agent.reset_message()
-    result = agent.run(build_input(user_task, memory_context, failure_context))
+    """Run the planner LLMNode once and return parsed steps."""
+    node.reset_message()
+    result = node.run(build_input(user_task, memory_context, failure_context))
     return parse_plan(result["text"])

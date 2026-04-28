@@ -1,13 +1,19 @@
 """
-Two-layer memory:
+Two-layer memory, three persisted files per benchmark instance:
 
-- Working memory: created per task, discarded after end_task. Holds the
+- Working memory: created per task, lives only during a task. Holds the
   task-level event_log (every tool call/result during this task), the plan,
   and candidate facts. observations / files_changed are *derived* from the
-  event_log, not stored directly.
+  event_log, not stored directly. At end_task() its full state is dumped to
+  working_memory.json (overwritten on next task), then the in-memory object
+  is discarded.
 
-- MemoryManager (long-term memory): Only candidate facts that passed the
-  tasks are stored here, with confidence scores.
+- Long-term memory (MemoryManager): project_context + task_history (without
+  event_log — that lives in working_memory.json) + this case's facts.
+
+- Global facts (cross-case, optional): facts pooled across all instances of
+  an experiment, with confidence reinforcement when the same fact is saved
+  by multiple cases.
 """
 
 import os
@@ -15,9 +21,7 @@ import json
 from datetime import datetime
 from typing import Optional
 
-import config
 from config import (
-    WORKSHOP,
     MAX_MEMORY_TASKS,
     MAX_MEMORY_FACTS,
     MAX_WORKING_OBSERVATIONS,
@@ -133,7 +137,7 @@ class WorkingMemory:
 
         if observations:
             parts.append("Recent observations from earlier steps:")
-            for obs in observations[-MAX_WORKING_OBSERVATIONS:][-10:]:
+            for obs in observations[-MAX_WORKING_OBSERVATIONS:]:
                 parts.append(f" - [{obs['kind']}] {obs['content']}")
 
         files_changed = self.files_changed
@@ -153,42 +157,39 @@ def _normalize_fact(fact: str) -> str:
 
 class MemoryManager:
     """
-    Two operating modes:
+    Three-file layout (per benchmark instance):
 
-    1. **Single-file mode** (default): all data — project_context, task_history,
-       and facts — live in the same memory.json. This is the P0 / single-project
-       use case.
+      long_term_memory.json   ← required: project_context + task_history
+                                  + this case's facts (filtered by source_task_id
+                                  if global_facts_file is also set).
+      working_memory.json     ← optional: full WorkingMemory snapshot, written
+                                  at end_task. Holds event_log + plan +
+                                  candidate_facts. Overwritten on each task end.
+      global_facts.json       ← optional: cross-case fact pool with confidence
+                                  reinforcement. Shared across all instances
+                                  of one experiment.
 
-    2. **Dual-file mode**: pass `global_facts_file=...` to split storage:
-         - `memory.json` (per-instance): project_context + task_history
-         - `global_facts.json` (shared): facts only
-       This is the benchmark mode (MBPP / SWE-bench), where each instance has
-       its own memory.json for inspection ("how did this instance fail?"), but
-       facts are pooled across instances so reinforcement actually happens.
-
-    The two modes are transparent to callers: `self.data["facts"]` always
-    returns the right set of facts; `_save()` writes to whichever file owns
-    each piece of data.
+    If `global_facts_file` is None, facts live entirely in long_term_memory.json
+    (single-file mode, useful for one-off projects). If set, facts are pooled
+    globally and the per-case file holds only that case's facts.
     """
 
     def __init__(
         self,
-        memory_file: Optional[str] = None,
+        long_term_file: str,
+        working_memory_file: Optional[str] = None,
         global_facts_file: Optional[str] = None,
     ):
-        if memory_file is None:
-            memory_dir = os.path.join(config.WORKSHOP, config.PROJECT_NAME)
-            os.makedirs(memory_dir, exist_ok=True)
-            memory_file = os.path.join(memory_dir, "memory.json")
-        self.memory_file = memory_file
-        self.global_facts_file = global_facts_file   # None = single-file mode
+        self.long_term_file = long_term_file
+        self.working_memory_file = working_memory_file
+        self.global_facts_file = global_facts_file
 
         self.data = self._load()
         self._working: Optional[WorkingMemory] = None
 
     def _load(self) -> dict:
-        if os.path.exists(self.memory_file):
-            with open(self.memory_file, 'r', encoding='utf-8') as f:
+        if os.path.exists(self.long_term_file):
+            with open(self.long_term_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         else:
             data = self._default_data()
@@ -210,12 +211,20 @@ class MemoryManager:
     def _save(self) -> None:
         if self.global_facts_file is not None:
             self._save_global_facts(self.data["facts"])
+            # Per-case long_term_memory.json keeps only facts promoted by this
+            # case's own tasks (filtered by source_task_id). The full pool
+            # lives in global_facts.json.
+            case_task_ids = {t["task_id"] for t in self.data["task_history"]}
+            case_facts = [
+                f for f in self.data["facts"]
+                if f.get("source_task_id") in case_task_ids
+            ]
             per_instance = {k: v for k, v in self.data.items() if k != "facts"}
-            per_instance["facts"] = []
-            with open(self.memory_file, 'w', encoding='utf-8') as f:
+            per_instance["facts"] = case_facts
+            with open(self.long_term_file, 'w', encoding='utf-8') as f:
                 json.dump(per_instance, f, indent=2, ensure_ascii=False)
         else:
-            with open(self.memory_file, 'w', encoding='utf-8') as f:
+            with open(self.long_term_file, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=2, ensure_ascii=False)
 
     def _save_global_facts(self, facts: list) -> None:
@@ -227,11 +236,31 @@ class MemoryManager:
         with open(self.global_facts_file, 'w', encoding='utf-8') as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
 
+    def _save_working_memory(self) -> None:
+        """Dump the current WorkingMemory state to disk. Overwrites on each
+        call — replans within a single task accumulate in the same WM, so
+        the dump captures the complete trajectory of the task."""
+        if self.working_memory_file is None or self._working is None:
+            return
+        wm = self._working
+        payload = {
+            "task_id": wm.task_id,
+            "user_prompt": wm.user_prompt,
+            "plan": wm.plan,
+            "candidate_facts": wm.candidate_facts,
+            "files_changed": sorted(wm.files_changed),
+            "event_log": list(wm.event_log.events),
+            "saved_at": self._now(),
+        }
+        os.makedirs(os.path.dirname(self.working_memory_file), exist_ok=True)
+        with open(self.working_memory_file, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
     def _default_data(self) -> dict:
         return {
             "project_context": {
-                "project_name": config.PROJECT_NAME,
-                "workspace": config.WORKSPACE,
+                "project_name": "",
+                "workspace": "",
                 "language": "",
                 "framework": "",
                 "entry_file": "",
@@ -277,10 +306,8 @@ class MemoryManager:
             "files_changed": files_changed,
             "attempts": attempts,
             "summary": summary,
-            # Persist the per-task event stream so we can replay LLM decisions
-            # offline without rerunning. Useful for debugging — without this the
-            # event_log is discarded when working memory drops.
-            "event_log": list(wm.event_log.events) if wm else [],
+            # event_log lives in working_memory.json (full per-task trajectory),
+            # not duplicated here.
         }
         if error_history:
             record["error_history"] = error_history
@@ -289,6 +316,10 @@ class MemoryManager:
         self._trim_task_history()
 
         self._evict_facts_if_needed(current_task_idx)
+
+        # Snapshot working memory before clearing — captures every replan/retry
+        # accumulated during this task.
+        self._save_working_memory()
 
         self._save()
 

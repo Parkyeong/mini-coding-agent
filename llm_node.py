@@ -1,9 +1,15 @@
-"""The agent loop. One class, used for every role (planner / coder / verifier).
+"""LLM execution node — the smallest reusable building block of the agent system.
 
-Role behaviour (system prompt, tools, max_steps, input building, output
-parsing) lives in the corresponding role module (planner.py / coder.py /
-verifier.py). This file only knows how to iterate: call LLM, dispatch tools,
-push events into working memory, stop when the LLM has nothing else to do.
+One class, used for every LLM-driven role (planner / coder). It runs the
+"prompt -> LLM -> maybe tool calls -> tool results -> repeat" loop up to
+max_steps times. Role-specific behaviour (system prompt, tools, input
+building, output parsing) lives in the role module (planner.py / coder.py),
+not here. This file only knows how to iterate.
+
+Naming note: this is the "node" in graph-based agent terminology (cf.
+LangGraph). The full *agent system* is engine.py + planner + coder + verifier
++ memory + tools + environment together. An LLMNode by itself is not a
+complete agent; it's a single reasoning/action unit.
 """
 
 import llm
@@ -11,17 +17,17 @@ from config import MAX_STEPS, ENABLE_METRICS
 from metrics import MetricsTracker
 
 
-# Tool args carrying a workspace path: agent loop normalises them to relative
+# Tool args carrying a workspace path: the loop normalises them to relative
 # paths before logging, so files_changed (derived from event_log) deduplicates
 # cleanly across absolute / relative variants emitted by the LLM.
 _PATH_ARG_TOOLS = ("write_file", "replace_in_file", "read_file")
 
 
-class Agent:
+class LLMNode:
     def __init__(
         self,
         system_prompt: str,
-        role: str = "agent",
+        role: str = "node",
         tools: list = None,
         max_steps: int = MAX_STEPS,
         env=None,
@@ -88,7 +94,7 @@ class Agent:
 
             self.messages.extend(llm.build_tool_result_message(calls_and_results))
 
-        output_text = f"agent reached max step {self.max_steps} without completing."
+        output_text = f"LLMNode reached max step {self.max_steps} without completing."
         self._record_metrics(steps_used, total_input_tokens, total_output_tokens, total_latency)
         return {"text": output_text, "completed": False}
 

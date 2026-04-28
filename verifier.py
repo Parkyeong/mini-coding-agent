@@ -5,13 +5,18 @@ verdict — no LLM judge needed. We just look at pytest's returncode and
 hand the failure output back as fix_suggestion for the next coder retry.
 """
 
-import config
 from config import VERIFIER_RUN_TESTS
 from test_runner import run_tests
 
 
-def verify(memory) -> dict:
+def verify(memory, env) -> dict:
     """Run the project's tests once.
+
+    Args:
+        memory:  MemoryManager — used to read project_context (test_command,
+                 test_timeout). May be None.
+        env:     Environment — owns the workspace path the tests run against.
+                 Required (we no longer fall back to a global config var).
 
     Returns:
         {
@@ -37,7 +42,7 @@ def verify(memory) -> dict:
         timeout_hint = ctx.get("test_timeout") or None
 
     result = run_tests(
-        workspace=config.WORKSPACE,
+        env,
         memory_hint_command=cmd_hint,
         memory_hint_timeout=timeout_hint,
     )

@@ -16,6 +16,10 @@ from typing import Optional
 
 
 class Environment:
+    # Used by test_runner / verifier to label which backend ran a test.
+    # Subclasses (e.g. DockerEnvironment) override this to identify themselves.
+    backend_name = "subprocess"
+
     def __init__(self, workspace: str, command_timeout: int = 20):
         self.workspace = os.path.abspath(workspace)
         self.command_timeout = command_timeout

@@ -1,14 +1,16 @@
 """
 Test runner for the verifier.
-Single backend: SubprocessRunner, runs whatever command is in test_command
-('pytest' or a 'docker run' string for SWE-bench).
+
+Domain logic only — test_command discovery (memory hint -> marker -> none),
+result-shape (TestRunResult), output truncation. The actual subprocess call
+is delegated to Environment.run_command, so when we add a DockerEnvironment
+later, test_runner doesn't need to know.
 """
 
 import os
 import subprocess
 from typing import Optional
 
-import config
 from config import VERIFIER_TEST_TIMEOUT_DEFAULT, VERIFIER_OUTPUT_MAX_CHARS
 
 
@@ -74,57 +76,6 @@ def _truncate(text: str, limit: int = VERIFIER_OUTPUT_MAX_CHARS) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess runner — only backend
-# ---------------------------------------------------------------------------
-class SubprocessRunner:
-    backend_name = "subprocess"
-
-    def run(self, command: str, workspace: str, timeout: int) -> TestRunResult:
-        try:
-            proc = subprocess.run(
-                command, shell=True, cwd=workspace,
-                capture_output=True, text=True, timeout=timeout,
-            )
-
-            return TestRunResult(
-                executed=True,
-                command=command,
-                returncode=proc.returncode,
-                stdout=_truncate(proc.stdout),
-                stderr=_truncate(proc.stderr),
-                timed_out=False,
-                backend=self.backend_name,
-                detection_source="",  # filled by run_tests()
-            )
-
-        except subprocess.TimeoutExpired as e:
-            return TestRunResult(
-                executed=True,
-                command=command,
-                returncode=None,
-                stdout=_truncate(e.stdout) if e.stdout else "",
-                stderr=_truncate(e.stderr) if e.stderr else "",
-                timed_out=True,
-                backend=self.backend_name,
-                detection_source="",
-                error=f"Timeout after {timeout}s",
-            )
-
-        except Exception as e:
-            return TestRunResult(
-                executed=False,
-                command=command,
-                returncode=None,
-                stdout="",
-                stderr="",
-                timed_out=False,
-                backend=self.backend_name,
-                detection_source="",
-                error=f"{type(e).__name__}: {e}",
-            )
-
-
-# ---------------------------------------------------------------------------
 # Marker-based fallback detection (Python only, per project decision)
 # ---------------------------------------------------------------------------
 def marker_based_test_detection(workspace: str) -> Optional[str]:
@@ -149,18 +100,22 @@ def marker_based_test_detection(workspace: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def run_tests(
-    workspace: str,
+    env,
     memory_hint_command: Optional[str] = None,
     memory_hint_timeout: Optional[int] = None,
 ) -> TestRunResult:
-    """Resolve the test command (memory -> marker -> none) and run it via SubprocessRunner."""
+    """Resolve the test command (memory -> marker -> none) and run it through env.
 
+    env is the same Environment instance the coder used; this guarantees tests
+    run against the exact files coder modified, and lets us swap to a Docker
+    backend later by changing only the env class.
+    """
     timeout = memory_hint_timeout or VERIFIER_TEST_TIMEOUT_DEFAULT
 
     if memory_hint_command:
         command, source = memory_hint_command.strip(), "memory"
     else:
-        detected = marker_based_test_detection(workspace)
+        detected = marker_based_test_detection(env.workspace)
         if detected:
             command, source = detected, "marker"
         else:
@@ -176,7 +131,41 @@ def run_tests(
                 error="No test command found in memory or via marker detection",
             )
 
-    runner = SubprocessRunner()
-    result = runner.run(command, workspace, timeout)
-    result.detection_source = source
-    return result
+    backend = getattr(env, "backend_name", "unknown")
+
+    try:
+        result = env.run_command(command, timeout=timeout)
+        return TestRunResult(
+            executed=True,
+            command=command,
+            returncode=result["returncode"],
+            stdout=_truncate(result["stdout"]),
+            stderr=_truncate(result["stderr"]),
+            timed_out=False,
+            backend=backend,
+            detection_source=source,
+        )
+    except subprocess.TimeoutExpired as e:
+        return TestRunResult(
+            executed=True,
+            command=command,
+            returncode=None,
+            stdout=_truncate(e.stdout) if e.stdout else "",
+            stderr=_truncate(e.stderr) if e.stderr else "",
+            timed_out=True,
+            backend=backend,
+            detection_source=source,
+            error=f"Timeout after {timeout}s",
+        )
+    except Exception as e:
+        return TestRunResult(
+            executed=False,
+            command=command,
+            returncode=None,
+            stdout="",
+            stderr="",
+            timed_out=False,
+            backend=backend,
+            detection_source=source,
+            error=f"{type(e).__name__}: {e}",
+        )

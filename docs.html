@@ -243,6 +243,94 @@
   .note-box.bad  { border-left-color: var(--red); background: rgba(242, 139, 130, 0.06); }
   .note-box.good { border-left-color: var(--green); background: rgba(129, 201, 149, 0.06); }
 
+  /* === Component layer diagram === */
+  .layer-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 18px 0;
+  }
+  .layer-row {
+    display: grid;
+    gap: 10px;
+  }
+  .layer-row.cols-1 { grid-template-columns: 1fr; }
+  .layer-row.cols-3 { grid-template-columns: repeat(3, 1fr); }
+  .layer-box {
+    background: var(--panel);
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    padding: 14px 18px;
+    font-size: 13.5px;
+  }
+  .layer-box .layer-name {
+    font-weight: 700;
+    color: var(--accent);
+    font-size: 14px;
+    margin-bottom: 4px;
+    font-family: "JetBrains Mono", Consolas, monospace;
+  }
+  .layer-box .layer-sub {
+    color: var(--text-dim);
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .layer-box.engine { border-color: var(--accent); background: rgba(138, 180, 248, 0.06); }
+  .layer-box.engine .layer-name { color: var(--accent); }
+  .layer-box.role { border-color: var(--accent-2); background: rgba(197, 138, 249, 0.05); }
+  .layer-box.role .layer-name { color: var(--accent-2); }
+  .layer-box.tools { border-color: var(--pink); background: rgba(242, 158, 212, 0.05); }
+  .layer-box.tools .layer-name { color: var(--pink); }
+  .layer-box.env { border-color: var(--green); background: rgba(129, 201, 149, 0.05); }
+  .layer-box.env .layer-name { color: var(--green); }
+  .layer-box.memory { border-color: var(--orange); background: rgba(253, 214, 99, 0.05); }
+  .layer-box.memory .layer-name { color: var(--orange); }
+  .layer-box.test { border-color: var(--red); background: rgba(242, 139, 130, 0.05); }
+  .layer-box.test .layer-name { color: var(--red); }
+  .flow-down {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 13px;
+    margin: -2px 0;
+    user-select: none;
+    letter-spacing: 1px;
+  }
+  .flow-down::before { content: "↓ "; font-size: 16px; color: var(--accent); }
+
+  /* === File layout cards === */
+  .file-layout {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+    margin: 16px 0 24px;
+  }
+  .file-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 0 8px 8px 0;
+    padding: 14px 18px;
+  }
+  .file-card.green  { border-left-color: var(--green); }
+  .file-card.orange { border-left-color: var(--orange); }
+  .file-card.pink   { border-left-color: var(--pink); }
+  .file-card .filename {
+    font-family: "JetBrains Mono", Consolas, monospace;
+    font-size: 12px;
+    color: var(--accent);
+    font-weight: 600;
+    margin-bottom: 8px;
+    word-break: break-all;
+  }
+  .file-card.green .filename  { color: var(--green); }
+  .file-card.orange .filename { color: var(--orange); }
+  .file-card.pink .filename   { color: var(--pink); }
+  .file-card .description {
+    font-size: 12.8px;
+    line-height: 1.6;
+    color: var(--text);
+  }
+
   .view { display: none; }
   .view.active { display: block; }
 
@@ -259,6 +347,7 @@
   <div class="brand">Mini Coding Agent</div>
   <div class="tabs">
     <button class="tab active" data-view="structure">Structure</button>
+    <button class="tab" data-view="components">Components</button>
     <button class="tab" data-view="dataset">Dataset</button>
   </div>
 </div>
@@ -270,28 +359,86 @@
   <!-- ============================================================ -->
   <div class="view active" id="structure">
 
-    <h1>Structure — 主流程</h1>
+    <h1>Structure — 一次任务的完整流程</h1>
     <p class="lead">
-      Mini Coding Agent 的运行主流程:从 <code>main()</code> 接收用户输入,
-      到 <code>end_task()</code> 收尾的完整链路。每张卡片对应一个阶段,点击"展开细节"看具体函数和关键代码。
+      按时间顺序追踪一个 user prompt 从进 runner 到 end_task 收尾的完整路径。
+      每个阶段标清楚:在哪个文件、谁调用谁、写了哪些数据、读了哪些数据。
     </p>
+
+    <h2>5 阶段全景</h2>
+    <p class="lead">从上到下按时间顺序;阶段 4 是带循环的主体。</p>
+
+    <div class="layer-stack">
+
+      <div class="layer-row cols-1">
+        <div class="layer-box engine">
+          <div class="layer-name">阶段 1 · Runner 入口</div>
+          <div class="layer-sub">runners/mbpp_task.py 读 prompt.md,新建 Environment + MemoryManager,调 engine.run_task</div>
+        </div>
+      </div>
+      <div class="flow-down">prompt 进 engine</div>
+
+      <div class="layer-row cols-1">
+        <div class="layer-box engine">
+          <div class="layer-name">阶段 2 · engine 启动 task</div>
+          <div class="layer-sub">memory.begin_task() 创建 WorkingMemory · memory.get_context_for_planner() 拿 facts + project_context</div>
+        </div>
+      </div>
+      <div class="flow-down">engine 调 planner</div>
+
+      <div class="layer-row cols-1">
+        <div class="layer-box role">
+          <div class="layer-name">阶段 3 · planner 出 plan</div>
+          <div class="layer-sub">planner LLMNode 跑一次 LLM(max_steps=1, 无 tools) → parse 成 plan_steps(list[str]) → working.set_plan</div>
+        </div>
+      </div>
+      <div class="flow-down">engine 逐 step 派给 coder</div>
+
+      <div class="layer-row cols-1">
+        <div class="layer-box role">
+          <div class="layer-name">阶段 4 · 主循环(retry + replan)</div>
+          <div class="layer-sub">
+            外层 replan ≤ MAX_REPLANS · 中层遍历 plan_steps · 内层 retry ≤ MAX_RETRIES_PER_STEP<br>
+            <b>每次 retry 三动作</b>:coder 用 tools 改 workspace → verifier 调 test_runner → engine 看 verdict 决定
+          </div>
+        </div>
+      </div>
+      <div class="flow-down">所有 step 过完 / 彻底失败</div>
+
+      <div class="layer-row cols-1">
+        <div class="layer-box memory">
+          <div class="layer-name">阶段 5 · end_task 收尾</div>
+          <div class="layer-sub">working_memory.json 落盘 · task_history 追加 · passed=True 时 candidate_facts 升级到 long-term + global facts</div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="note-box">
+      <b>关键认知</b>:engine 是流程总管,决定 retry / replan / 结束。coder <b>不直接看</b> verifier 输出 —— verdict 回到 engine,engine 把 fix_suggestion 拼进下一轮 prompt 给 coder。一句话:<br>
+      <b>"engine 调度,planner / coder 想,tools / test_runner 翻译,env 干活,memory 旁观记录。"</b>
+    </div>
+
+
+    <h2>逐阶段展开</h2>
 
     <!-- Step 1 -->
     <div class="step open">
       <div class="step-header">
         <div>
-          <p class="title">1. 接收用户输入</p>
-          <p class="summary">程序从 CLI 主循环开始,等待 user prompt。</p>
+          <p class="title">1. Runner 入口:读 prompt.md</p>
+          <p class="summary">通过 <code>python -m runners.mbpp_task</code> 启动,逐个 case 加载 prompt 喂给 engine。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">文件</div><div class="v"><span class="pill">main.py</span></div>
-          <div class="k">函数</div><div class="v"><span class="pill">main()</span></div>
-          <div class="k">关键代码</div><div class="v"><span class="pill">user_input = input("\n User:").strip()</span></div>
-          <div class="k">下一跳</div><div class="v"><span class="pill">run_task(user_input, planner, coder, memory, metrics)</span></div>
-          <div class="k">说明</div><div class="v">verifier 不再是 Agent,是一个纯 pytest 函数(verifier.verify(memory)),所以不出现在参数列表里</div>
+          <div class="k">命令</div><div class="v"><span class="pill">python -m runners.mbpp_task all --exp baseline --limit 1</span></div>
+          <div class="k">文件</div><div class="v"><span class="pill">runners/mbpp_task.py</span></div>
+          <div class="k">函数</div><div class="v"><span class="pill">cmd_run(args)</span> → <span class="pill">run_one(workspace, facts_file)</span></div>
+          <div class="k">读 prompt</div><div class="v"><span class="pill">prompt = open(workspace/prompt.md).read()</span> — 不是 terminal 输入,是从数据集物化出来的题面</div>
+          <div class="k">下一跳</div><div class="v"><span class="pill">engine.run_task(prompt, planner, coder, memory, metrics)</span></div>
+          <div class="k">说明</div><div class="v">verifier 不是 LLMNode,是一个纯 pytest 函数(<code>verifier.verify(memory, env)</code>),所以不出现在参数列表里。env 由 coder.env 复用,不再读全局 config.WORKSPACE</div>
         </div>
       </div>
     </div>
@@ -308,7 +455,7 @@
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">文件</div><div class="v"><span class="pill">main.py</span></div>
+          <div class="k">文件</div><div class="v"><span class="pill">engine.py</span></div>
           <div class="k">函数</div><div class="v"><span class="pill">run_task()</span></div>
           <div class="k">关键调用</div><div class="v">
             <span class="pill purple">memory.generate_task_id()</span>
@@ -322,6 +469,7 @@
             <span class="pill">failure_context = None</span>
             <span class="pill">overall_passed = False</span>
           </div>
+          <div class="k">memory_context</div><div class="v">从 long-term memory 读出 project_context + 按 confidence 排序的 top-N facts + 最近几条 task_history,拼成字符串给 planner</div>
         </div>
       </div>
     </div>
@@ -338,16 +486,16 @@
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">调用链</div><div class="v"><span class="pill">planner_role.create_plan(agent, ...)</span> → <span class="pill">Agent.run</span> → <span class="pill red">llm.chat</span></div>
+          <div class="k">调用链</div><div class="v"><span class="pill">planner_role.create_plan(node, ...)</span> → <span class="pill">LLMNode.run</span> → <span class="pill red">llm.chat</span></div>
           <div class="k">输入</div><div class="v">
             <span class="pill">user_task</span>
             <span class="pill">memory_context</span>
             <span class="pill">failure_context</span>
           </div>
-          <div class="k">特点</div><div class="v">planner Agent 不带 tools,<span class="pill">max_steps = 1</span> —— 一次 LLM 调用直接出 plan,然后 <span class="pill purple">parse_plan(text)</span> 拆成 list</div>
+          <div class="k">特点</div><div class="v">planner LLMNode 不带 tools,<span class="pill">max_steps = 1</span> —— 一次 LLM 调用直接出 plan,然后 <span class="pill purple">parse_plan(text)</span> 拆成 list</div>
           <div class="k">输出</div><div class="v"><span class="pill green">plan_steps: list[str]</span></div>
           <div class="k">写回</div><div class="v"><span class="pill purple">working.set_plan(plan_steps)</span></div>
-          <div class="k">注意</div><div class="v">planner / coder / verifier 不再是 BaseAgent 的子类,而是同一个 <span class="pill">Agent</span> 类的不同实例(role / system_prompt / tools 是构造参数)</div>
+          <div class="k">注意</div><div class="v">planner / coder 是同一个 <span class="pill">LLMNode</span> 类的不同实例(role / system_prompt / tools 是构造参数);verifier 不是 LLMNode,是纯函数。<b>"agent" 指的是 engine + 多个 LLMNode + verifier + memory 整体</b>,不是单个 LLMNode</div>
         </div>
       </div>
     </div>
@@ -378,17 +526,17 @@
       <div class="step-header">
         <div>
           <p class="title">5. Coder 执行当前 step</p>
-          <p class="summary">coder 是带工具的 Agent 实例,跑 ReAct loop。每次启动前先把 working memory snapshot 拼到 prompt 前面,让它知道前面 step 学到了什么。</p>
+          <p class="summary">coder 是带工具的 LLMNode 实例,跑 ReAct loop。每次启动前先把 working memory snapshot 拼到 prompt 前面,让它知道前面 step 学到了什么。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">调用链</div><div class="v"><span class="pill">coder_role.run_coder(coder, step, memory)</span> → <span class="pill">Agent.run</span></div>
+          <div class="k">调用链</div><div class="v"><span class="pill">coder_role.run_coder(coder, step, memory)</span> → <span class="pill">LLMNode.run</span></div>
           <div class="k">注入 snapshot</div><div class="v"><span class="pill purple">memory.get_working().snapshot_for_coder()</span> 拼到 user 消息前面 — 包含 plan / 之前 step 的 observations / files_changed</div>
-          <div class="k">LLM loop</div><div class="v"><span class="pill">Agent.run()</span> 内部循环最多 <code>MAX_STEPS=8</code> 步,每步 <span class="pill red">llm.chat()</span> → 解析 tool_calls → <span class="pill">execute_tool(name, args, env, memory)</span></div>
+          <div class="k">LLM loop</div><div class="v"><span class="pill">LLMNode.run()</span> 内部循环最多 <code>MAX_STEPS=8</code> 步,每步 <span class="pill red">llm.chat()</span> → 解析 tool_calls → <span class="pill">execute_tool(name, args, env, memory)</span></div>
           <div class="k">tool 调度</div><div class="v">tool 函数纯净,只依赖 <span class="pill">Environment</span> 和(对 save_memory 而言)memory,不写 working memory</div>
-          <div class="k">事件落地</div><div class="v">每次 LLM 往返 / tool_call / tool_result / final text 都由 Agent loop push 到 <span class="pill purple">working.event_log</span></div>
+          <div class="k">事件落地</div><div class="v">每次 LLM 往返 / tool_call / tool_result / final text 都由 LLMNode 循环 push 到 <span class="pill purple">working.event_log</span></div>
           <div class="k">派生视图</div><div class="v">
             <span class="pill green">working.observations() — 由 event_log 中的 read_file/list_dir tool_result 派生</span>
             <span class="pill green">working.files_changed — 由 event_log 中的 write_file/replace_in_file 派生</span>
@@ -404,14 +552,14 @@
       <div class="step-header">
         <div>
           <p class="title">6. Verifier 跑 pytest(纯函数,不调 LLM)</p>
-          <p class="summary">verifier 不再是 Agent,是一个纯函数。从 memory 拿 test_command,subprocess 跑 pytest,看 returncode 直接出结论。失败时把 stderr 末尾喂给 coder 重试。</p>
+          <p class="summary">verifier 不是 LLMNode,是一个纯函数。从 memory 拿 test_command,subprocess 跑 pytest,看 returncode 直接出结论。失败时把 stderr 末尾喂给 coder 重试。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">调用</div><div class="v"><span class="pill">verifier.verify(memory)</span> — 签名极简,只要 memory</div>
-          <div class="k">真跑测试</div><div class="v"><span class="pill purple">maybe_run_test(memory)</span> → <span class="pill green">test_runner.run_tests()</span> → <span class="pill green">SubprocessRunner.run()</span></div>
+          <div class="k">调用</div><div class="v"><span class="pill">verifier.verify(memory, env=coder.env)</span> — env 显式传入,不再读全局 config.WORKSPACE</div>
+          <div class="k">真跑测试</div><div class="v"><span class="pill green">test_runner.run_tests(env, ...)</span> → <span class="pill green">env.run_command(command, timeout=...)</span></div>
           <div class="k">test_command</div><div class="v">3 级 fallback: <span class="pill">memory.project_context.test_command</span> → <span class="pill orange">marker(pytest.ini/pyproject.toml/tests/)</span> → <span class="pill red">skip</span></div>
           <div class="k">判定</div><div class="v"><span class="pill green">result.passed()</span> = <code>executed AND not timed_out AND returncode == 0</code> — 没有 LLM 介入</div>
           <div class="k">挂掉时</div><div class="v"><span class="pill orange">fix_suggestion = (stderr 或 stdout)[-1500:]</span> — pytest 失败堆栈末尾,喂给 coder 下一轮重试</div>
@@ -446,8 +594,8 @@
     <div class="step">
       <div class="step-header">
         <div>
-          <p class="title">8. end_task 收尾</p>
-          <p class="summary">不管成功失败都进入 finally,确保 working memory 一定被 promote 或丢弃,task_history 一定写盘。</p>
+          <p class="title">8. end_task 收尾(三文件落盘)</p>
+          <p class="summary">不管成功失败都进入 finally,确保 working memory 落盘 + long-term + global 三个文件都同步。</p>
         </div>
         <div class="toggle"></div>
       </div>
@@ -457,14 +605,333 @@
           <div class="k">调用</div><div class="v"><span class="pill purple">memory.end_task(task_id, passed=overall_passed, plan, attempts, summary)</span></div>
           <div class="k">passed=True</div><div class="v">遍历 wm.candidate_facts → <span class="pill purple">_promote_fact()</span> → 写入 long-term(reinforce 已有 / append 新)</div>
           <div class="k">passed=False</div><div class="v"><span class="pill red">candidate_facts 全部丢弃</span> → 不污染长期记忆</div>
-          <div class="k">必做</div><div class="v">追加 task_history → trim → <span class="pill purple">_evict_facts_if_needed()</span> → <span class="pill purple">_save()</span> → drop working memory</div>
-          <div class="k">双轨模式</div><div class="v">_save() 自动判断:有 global_facts_file → 把 facts 写到 global,其余写 per-instance</div>
+          <div class="k">必做</div><div class="v">追加 task_history (不含 event_log) → trim → <span class="pill purple">_evict_facts_if_needed()</span> → <span class="pill purple">_save_working_memory()</span> → <span class="pill purple">_save()</span> → drop working memory</div>
+          <div class="k">三文件写盘</div><div class="v">
+            <span class="pill green">working_memory.json</span> ← 整个 WM 快照(event_log + plan + candidate_facts + files_changed)<br>
+            <span class="pill green">long_term_memory.json</span> ← project_context + task_history + 本 case facts (按 source_task_id 过滤)<br>
+            <span class="pill green">mbpp_global_facts.json</span> ← 全部 facts(跨 case 累积)
+          </div>
         </div>
       </div>
     </div>
 
   </div>
 
+
+  <!-- ============================================================ -->
+  <!-- =======================  COMPONENTS  ======================= -->
+  <!-- ============================================================ -->
+  <div class="view" id="components">
+
+    <h1>Components — 各层职责与关系</h1>
+    <p class="lead">
+      把 <code>tools/</code> · <code>environment.py</code> · <code>memory.py</code> · <code>test_runner.py</code>
+      四个核心组件的位置 / 调用关系 / 数据落盘点画清楚。读完之后,任意一次 LLM 决策都能追溯到具体文件 + 写入了哪个磁盘位置。
+    </p>
+
+    <!-- ====== 整体分层 ====== -->
+    <h2>整体分层</h2>
+    <p class="lead">从上往下,箭头是"调用方向"。流程层(engine / planner / coder / verifier)互相调用;基础设施层(tools / memory / test_runner / environment)被流程层使用。</p>
+
+    <div class="layer-stack">
+
+      <div class="layer-row cols-1">
+        <div class="layer-box engine">
+          <div class="layer-name">engine.py</div>
+          <div class="layer-sub">Orchestrator — <code>run_task()</code> 编排 plan → execute → verify → retry / replan 主循环。是唯一进入流程层的入口,被 runners/mbpp_task.py 调用。</div>
+        </div>
+      </div>
+
+      <div class="flow-down">calls each role</div>
+
+      <div class="layer-row cols-3">
+        <div class="layer-box role">
+          <div class="layer-name">planner.py</div>
+          <div class="layer-sub">LLMNode (max_steps=1, 无 tools) — 拆任务为 step 列表,只调一次 LLM</div>
+        </div>
+        <div class="layer-box role">
+          <div class="layer-name">coder.py</div>
+          <div class="layer-sub">LLMNode (max_steps=8, 带 tools) — ReAct 循环,逐步执行 plan 中的某一步</div>
+        </div>
+        <div class="layer-box role">
+          <div class="layer-name">verifier.py</div>
+          <div class="layer-sub">纯函数,不调 LLM — 跑 pytest 看 returncode,返回 verdict dict</div>
+        </div>
+      </div>
+
+      <div class="flow-down">use infrastructure</div>
+
+      <div class="layer-row cols-3">
+        <div class="layer-box tools">
+          <div class="layer-name">tools/ &amp; llm.py</div>
+          <div class="layer-sub">tools/ = LLM 看到的"菜单"(schema)+ 执行结果格式化。<br>llm.py = OpenRouter HTTP 客户端(requests,无 SDK)</div>
+        </div>
+        <div class="layer-box memory">
+          <div class="layer-name">memory.py</div>
+          <div class="layer-sub">事件流 + WorkingMemory + 长期 + 全局 facts。<br>横切层,所有角色 + agent loop 都读写它</div>
+        </div>
+        <div class="layer-box test">
+          <div class="layer-name">test_runner.py</div>
+          <div class="layer-sub">test 领域逻辑:三级 test_command 探测 + TestRunResult 包装。<br>真正的 subprocess 调用委托给 env.run_command</div>
+        </div>
+      </div>
+
+      <div class="flow-down">delegate physical ops to</div>
+
+      <div class="layer-row cols-1">
+        <div class="layer-box env">
+          <div class="layer-name">environment.py</div>
+          <div class="layer-sub">workspace 路径作用域 + read/write/list/walk/run_command 原语。tools 和 test_runner 最终都通过它落地到系统调用 (open / subprocess / os.walk)</div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="note-box">
+      <b>横切关系:event_log 怎么传播</b><br>
+      LLMNode 循环 (在 <code>llm_node.py</code> 的 <code>LLMNode.run()</code> 里) 每次 LLM 往返 / tool_call / tool_result 都
+      会主动 push 一条事件到 <code>working memory.event_log</code>。tool 函数本身不 import memory,
+      所以保持纯净。<code>working.observations()</code> 和 <code>working.files_changed</code>
+      都是事件流的派生视图,不是单独存的字段。
+    </div>
+
+
+    <!-- ====== Tools 层 ====== -->
+    <h2>Tools 层</h2>
+
+    <div class="step open">
+      <div class="step-header">
+        <div>
+          <p class="title">tools/ — LLM 与底层之间的翻译层</p>
+          <p class="summary">告诉 LLM "你能调哪些函数",并把执行结果格式化成字符串。Tools 不直接做事,委托给 environment / memory。</p>
+        </div>
+        <div class="toggle"></div>
+      </div>
+      <div class="step-body">
+        <div class="kv">
+          <div class="k">谁调用</div><div class="v">
+            <span class="pill purple">llm_node.py LLMNode.run()</span> 当 LLM 返回 tool_calls 时,通过 <span class="pill">execute_tool(name, args, env, memory)</span> dispatch
+          </div>
+          <div class="k">它调用谁</div><div class="v">
+            <span class="pill green">environment.py</span> 的 read/write/list/walk/run_command (大部分 fs/shell tools)<br>
+            <span class="pill orange">memory.py</span> WorkingMemory.add_candidate_fact (只有 save_memory tool)
+          </div>
+          <div class="k">输入</div><div class="v">tool 名字 + args dict (llm.py 已把 OpenRouter 返回的 JSON 字符串解析过了)</div>
+          <div class="k">输出</div><div class="v">单个字符串(LLM 友好的格式),如 <code>"[FILE]solution.py\n[FILE]prompt.md"</code> 或 <code>"File not found"</code></div>
+          <div class="k">写盘</div><div class="v"><span class="pill red">不直接写盘</span> — 副作用全部委托给下层。事件由 <b>agent loop</b> push 到 working memory event_log</div>
+          <div class="k">关键文件</div><div class="v">
+            <span class="pill">tools/__init__.py</span> TOOL_DEFINITIONS schema + execute_tool dispatcher<br>
+            <span class="pill">tools/fs.py</span> read/write/list/search/replace<br>
+            <span class="pill">tools/shell.py</span> run_command<br>
+            <span class="pill">tools/memory_tool.py</span> save_memory(唯一吃 memory 的工具)
+          </div>
+          <div class="k">为什么单独抽一层</div><div class="v">tools/ 不应该 import subprocess / 知道 docker。哪天换 backend,tools/ 一行不用改</div>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ====== Environment 层 ====== -->
+    <h2>Environment 层</h2>
+
+    <div class="step">
+      <div class="step-header">
+        <div>
+          <p class="title">environment.py — workspace 内的物理操作原语</p>
+          <p class="summary">真正去打开文件、跑 subprocess。当前是本地 subprocess + safe_path 路径限制,将来切 docker 只动这一个文件。</p>
+        </div>
+        <div class="toggle"></div>
+      </div>
+      <div class="step-body">
+        <div class="kv">
+          <div class="k">谁调用</div><div class="v">
+            <span class="pill pink">tools/*</span> 大头 — fs/shell tools 全部委托过来<br>
+            <span class="pill red">verifier 间接调用</span> — 通过 <code>test_runner.run_tests(env, ...)</code> → <code>env.run_command(...)</code>
+          </div>
+          <div class="k">它调用谁</div><div class="v">系统调用 — <code>open()</code>, <code>os.walk()</code>, <code>os.listdir()</code>, <code>subprocess.run()</code></div>
+          <div class="k">输入</div><div class="v">路径字符串 / shell 命令字符串 / timeout 数字</div>
+          <div class="k">输出</div><div class="v">Python 原生类型 — <code>str</code> · <code>list[dict]</code> · <code>dict</code>。失败抛 Python 异常(交给 tools/ 翻译)</div>
+          <div class="k">写盘</div><div class="v"><span class="pill orange">间接写</span> — write_file 写 workspace 内文件;不写 memory.json 等元数据文件</div>
+          <div class="k">路径限制</div><div class="v"><span class="pill">safe_path()</span> 阻止路径越出 workspace</div>
+          <div class="k">⚠️ 不是真 sandbox</div><div class="v"><span class="pill warn">run_command 是 shell=True + 任意字符串</span>。LLM 想 <code>rm ~</code> 完全跑得起来。当前 environment 只是路径作用域 + cwd 绑定,不是隔离环境。真要 sandbox 得加 docker / unshare</div>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ====== Memory 子系统 ====== -->
+    <h2>Memory 子系统</h2>
+    <p class="lead">
+      逻辑两层:<b>WorkingMemory</b>(任务级 RAM 对象)+ <b>MemoryManager</b>(持久化层)。
+      落盘三个文件,每个文件由不同的代码路径写入,关注不同的生命周期。
+    </p>
+
+    <h3>三个落盘文件</h3>
+    <div class="file-layout">
+      <div class="file-card green">
+        <div class="filename">single_case_details/&lt;case&gt;/working_memory.json</div>
+        <div class="description">
+          <b>每个 case 一个</b> · end_task 时<b>覆写</b><br><br>
+          装:<code>event_log</code>(每次 LLM 调用 / tool_call / tool_result 的原始流)+ <code>plan</code> + <code>candidate_facts</code> + <code>files_changed</code> + saved_at。<br><br>
+          <b>主用途</b>:debug 时回放整个 task 的 LLM 决策。同 task 内多次 replan 共享一个 WorkingMemory,事件累加,最后只 dump 一次。
+        </div>
+      </div>
+      <div class="file-card orange">
+        <div class="filename">single_case_details/&lt;case&gt;/long_term_memory.json</div>
+        <div class="description">
+          <b>每个 case 一个</b> · end_task 时<b>追加</b>(task_history)<br><br>
+          装:<code>project_context</code> + <code>task_history</code>(本 case 的任务记录,<b>不带 event_log</b>) + 本 case 学到的 <code>facts</code>(按 source_task_id 过滤)。<br><br>
+          <b>主用途</b>:case 自己的"档案",独立可读,不依赖 working memory 文件。
+        </div>
+      </div>
+      <div class="file-card pink">
+        <div class="filename">&lt;exp&gt;/mbpp_global_facts.json</div>
+        <div class="description">
+          <b>整个实验一个</b> · 每个 case end_task 时<b>累加</b><br><br>
+          装:跨 case 共享的 facts pool,confidence 累加(同一条 fact 被多个 case 学到 → confidence ↑)。<br><br>
+          <b>主用途</b>:跨 case "记忆流动" — planner 启动时按 confidence 拿 top-N 注入 prompt。这是<b>唯一跨 case 流动</b>的存储。
+        </div>
+      </div>
+    </div>
+
+    <h3>WorkingMemory(任务级 RAM 对象,end_task 时 dump)</h3>
+    <div class="step">
+      <div class="step-header">
+        <div>
+          <p class="title">memory.py WorkingMemory — 任务进行中的"草稿纸"</p>
+          <p class="summary">begin_task() 创建,end_task() 落盘后丢弃。一个 task 内不管 retry / replan 多少次,共享同一个实例,event_log 持续累加。</p>
+        </div>
+        <div class="toggle"></div>
+      </div>
+      <div class="step-body">
+        <div class="kv">
+          <div class="k">谁创建</div><div class="v"><span class="pill purple">memory.begin_task(task_id, user_prompt)</span>,在 engine.run_task 入口调一次</div>
+          <div class="k">谁写</div><div class="v">
+            <span class="pill purple">agent loop</span> push event_log(llm_call / text / tool_call / tool_result)<br>
+            <span class="pill">save_memory tool</span> add_candidate_fact()<br>
+            <span class="pill">engine</span> set_plan(plan_steps)
+          </div>
+          <div class="k">谁读</div><div class="v">
+            <span class="pill">coder</span> 启动每步前读 <code>snapshot_for_coder()</code>(plan + 最近 observations + files_changed)<br>
+            <span class="pill">end_task</span> 读 candidate_facts 决定是否 promote
+          </div>
+          <div class="k">字段</div><div class="v">
+            event_log · plan · candidate_facts · user_prompt · task_id<br>
+            (派生属性:files_changed / observations 都从 event_log 派生,不存储)
+          </div>
+          <div class="k">何时落盘</div><div class="v">end_task() 调 <span class="pill purple">_save_working_memory()</span>,整个对象 dump 到 working_memory.json</div>
+          <div class="k">replan 累积</div><div class="v">同一 task 内 planner 重新规划时,WorkingMemory <b>不重建</b>,event_log 继续追加。多次 plan 的所有事件都在<b>同一个</b> working_memory.json 里</div>
+        </div>
+      </div>
+    </div>
+
+    <h3>MemoryManager(持久化层,跨 task 存活)</h3>
+    <div class="step">
+      <div class="step-header">
+        <div>
+          <p class="title">memory.py MemoryManager — 长期记忆的读 / 写中心</p>
+          <p class="summary">每个 case 跑 run_one() 时新建一个,加载 long_term + global,end_task 时把 working memory 落盘 + 推 facts 到 long-term + 同步 global。</p>
+        </div>
+        <div class="toggle"></div>
+      </div>
+      <div class="step-body">
+        <div class="kv">
+          <div class="k">构造参数</div><div class="v">
+            <span class="pill">long_term_file</span>(必传) ·
+            <span class="pill">working_memory_file</span>(可选) ·
+            <span class="pill">global_facts_file</span>(可选)
+          </div>
+          <div class="k">_load() 行为</div><div class="v">
+            1. 读 long_term_file → project_context + task_history + facts<br>
+            2. 若有 global_facts_file → 用 global facts <b>覆盖</b> self.data["facts"]<br>
+            (这是"跨 case 记忆流动"的关键:每个 case 启动时看到的就是上一个 case 留下的 global pool)
+          </div>
+          <div class="k">_save() 行为</div><div class="v">
+            <b>dual-file mode</b>:全部 facts → global file;long_term file 只保留<b>本 case 学的 facts</b>(按 source_task_id 过滤)<br>
+            <b>single-file mode</b>:全部数据 → long_term file
+          </div>
+          <div class="k">facts 流转链</div><div class="v">
+            coder 调 save_memory tool → WorkingMemory.candidate_facts<br>
+            → end_task 时若 passed → <span class="pill purple">_promote_fact()</span> → self.data["facts"]<br>
+            → _save() → 同时写 per-case(filtered)+ global(full)
+          </div>
+          <div class="k">读时谁用</div><div class="v">planner 启动前 <span class="pill">memory.get_context_for_planner()</span> → 按 confidence 排序的 top-N facts + project_context + 最近 task_history → 拼成 prompt 段落</div>
+          <div class="k">confidence 累积</div><div class="v">
+            新 fact:confidence = 0(<code>FACT_INITIAL_CONFIDENCE</code>)<br>
+            重复出现:每次 +0.2,封顶 1.0(<code>FACT_REINFORCE_DELTA / FACT_MAX_CONFIDENCE</code>)<br>
+            evict 策略:超过 <code>MAX_MEMORY_FACTS</code> 时按 (in_grace_period, score, age) 淘汰
+          </div>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ====== Verifier / Test Runner ====== -->
+    <h2>Verifier 与 Test Runner</h2>
+    <p class="lead">
+      两层分得很干净:<b>verifier</b> 是判决,<b>test_runner</b> 是执行。
+      verifier 不知道测试是怎么跑的(subprocess / docker),它只读 TestRunResult 字段。
+      这是 SWE-bench 时升级 docker backend 的关键,verifier 一行不用改。
+    </p>
+
+    <div class="step">
+      <div class="step-header">
+        <div>
+          <p class="title">verifier.py — 判决层(纯函数,不调 LLM)</p>
+          <p class="summary">engine 每跑完一步 coder 都调一次 verify(memory, env)。把 TestRunResult 翻译成给 engine / coder 看的 verdict dict。</p>
+        </div>
+        <div class="toggle"></div>
+      </div>
+      <div class="step-body">
+        <div class="kv">
+          <div class="k">谁调用</div><div class="v"><span class="pill purple">engine.py run_task()</span> 在每步 coder 跑完后</div>
+          <div class="k">它调用谁</div><div class="v"><span class="pill red">test_runner.run_tests(env, memory_hint_command, memory_hint_timeout)</span></div>
+          <div class="k">输入</div><div class="v">
+            <span class="pill">memory</span> — 读 project_context.test_command / test_timeout<br>
+            <span class="pill">env</span> — 整个 Environment 实例传给 test_runner;<b>跟 coder 用的是同一个 env</b>,所以测试看到的就是 coder 改完的文件
+          </div>
+          <div class="k">输出</div><div class="v"><span class="pill green">{passed: bool, reason: str, fix_suggestion: str, test_block: str}</span></div>
+          <div class="k">fix_suggestion 哪来</div><div class="v">
+            <b>不是 LLM 总结</b>,是 pytest 真实 stderr/stdout <b>末尾 1500 字</b>。<br>
+            下一轮 coder LLM 直接读 traceback 自己思考怎么 fix
+          </div>
+          <div class="k">不在乎什么</div><div class="v">不知道 test 是 subprocess / docker / 远程跑的 — 只看 TestRunResult 字段</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-header">
+        <div>
+          <p class="title">test_runner.py — test 领域逻辑(命令探测 + 结果包装)</p>
+          <p class="summary">不直接做 subprocess。命令探测 + 结果整理是 test_runner 的事;真正跑命令委托给 env.run_command。</p>
+        </div>
+        <div class="toggle"></div>
+      </div>
+      <div class="step-body">
+        <div class="kv">
+          <div class="k">谁调用</div><div class="v"><span class="pill red">verifier.verify()</span></div>
+          <div class="k">它调用谁</div><div class="v"><span class="pill">env.run_command(command, timeout=...)</span> — 全代码库唯一的 subprocess 调用点在 env 内部</div>
+          <div class="k">test_command 三级 fallback</div><div class="v">
+            1. memory.project_context.test_command(memory 提供,优先)<br>
+            2. marker 探测 — pytest.ini / pyproject.toml / tests/ 任一存在 → "pytest -q"<br>
+            3. 都没有 → skip,executed=False
+          </div>
+          <div class="k">输出</div><div class="v"><span class="pill">TestRunResult(executed, command, returncode, stdout, stderr, timed_out, backend, detection_source, error)</span> — 数据结构,不做判决。<code>backend</code> 字段从 <code>env.backend_name</code> 读</div>
+          <div class="k">输出截断</div><div class="v">stdout/stderr 各超过 4000 字符时,头尾切 + 中间标记 <code>[truncated N chars]</code></div>
+          <div class="k">异常处理</div><div class="v">env.run_command 抛 <code>subprocess.TimeoutExpired</code> → test_runner 包成 <code>timed_out=True</code> 的 TestRunResult。其他异常包成 <code>executed=False</code> + error 字段</div>
+          <div class="k">未来扩展</div><div class="v">不需要在 test_runner 加 backend 抽象。直接实现 <span class="pill">DockerEnvironment(Environment)</span>,覆盖 <code>run_command</code> 即可。test_runner / verifier 一行不改</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="note-box good">
+      <b>分层回报</b>:重构后 <b>整个代码库只有 environment.run_command 一处 subprocess.run 调用</b>。
+      tools/shell.py 和 test_runner.py 都通过它走。SWE-bench 加 docker 时,实现 DockerEnvironment 子类、覆盖 run_command,
+      <b>tools / test_runner / verifier 全部 0 行修改</b>。
+    </div>
+
+  </div>
 
   <!-- ============================================================ -->
   <!-- =========================  DATASET  ======================== -->
@@ -566,7 +1033,7 @@
       <div class="step-header">
         <div>
           <p class="title">2. materialize_instance: 为每条题写出 4 个文件</p>
-          <p class="summary">workspace + solution.py + test_solution.py + prompt.md + memory.json</p>
+          <p class="summary">workspace + solution.py + test_solution.py + prompt.md + long_term_memory.json</p>
         </div>
         <div class="toggle"></div>
       </div>
@@ -576,7 +1043,8 @@
           <div class="k">solution.py</div><div class="v">空 stub,等 agent 填代码</div>
           <div class="k">test_solution.py</div><div class="v"><code>from solution import *</code> + 把 test_list 包成 <code>def test_case_N():</code> 函数</div>
           <div class="k">prompt.md</div><div class="v">MBPP 描述 + <b>展示 test_list</b> 给 agent 看(否则 agent 猜不到函数名)</div>
-          <div class="k">memory.json</div><div class="v"><b>预填 test_command</b>: <code>"pytest -q test_solution.py"</code> + project_context</div>
+          <div class="k">long_term_memory.json</div><div class="v"><b>预填 test_command</b>: <code>"pytest -q test_solution.py"</code> + project_context(language=python, framework=pytest, test_timeout=30)。task_history 和 facts 初始为空</div>
+          <div class="k">working_memory.json</div><div class="v">setup 阶段<b>不预创建</b>。run 阶段每个 task 的 end_task() 写一次,覆盖式</div>
         </div>
       </div>
     </div>
@@ -598,16 +1066,17 @@
     │   │   ├── solution.py              # 空 stub
     │   │   ├── test_solution.py         # pytest harness
     │   │   ├── prompt.md                # 描述 + test 案例
-    │   │   └── memory.json              # project_context + task_history
+    │   │   ├── long_term_memory.json    # project_context + task_history + 本 case facts
+    │   │   └── working_memory.json      # task 跑完后的 WM 快照(event_log + plan + cand. facts)
     │   ├── mbpp_0012/
     │   └── ...
-    ├── mbpp_global_facts.json           # 这次实验的累积 facts
+    ├── mbpp_global_facts.json           # 跨 case 共享 facts(confidence 累积)
     └── mbpp_exp_final_results.json      # 结构化 report</code></pre>
       </div>
     </div>
 
     <h3>run 子命令流程</h3>
-    <p class="lead">扫 <code>&lt;exp&gt;/single_case_details/mbpp_*</code>,逐条切 config.WORKSPACE,调 main.run_task,把 report 写到实验目录。</p>
+    <p class="lead">扫 <code>&lt;exp&gt;/single_case_details/mbpp_*</code>,逐条新建 Environment + MemoryManager,调 engine.run_task,把 report 写到实验目录。</p>
 
     <div class="step">
       <div class="step-header">
@@ -630,16 +1099,16 @@
     <div class="step">
       <div class="step-header">
         <div>
-          <p class="title">2. 切换全局 WORKSPACE</p>
-          <p class="summary">每条 instance 跑之前 mutate config.WORKSPACE,让 environment / verifier / tools 都看到正确路径。</p>
+          <p class="title">2. 每个 case 新建 Environment(workspace 显式)</p>
+          <p class="summary">不再 mutate 全局变量。env 持有 workspace,后续 verifier 通过 env.workspace 拿到。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">代码</div><div class="v"><span class="pill warn">config_module.WORKSPACE = workspace</span></div>
-          <div class="k">为什么</div><div class="v">verifier 跑 pytest 时读 <code>config.WORKSPACE</code>,运行时切换才能让每个 case 在自己的 workspace 里跑</div>
-          <div class="k">env 实例</div><div class="v"><span class="pill">Environment(workspace, command_timeout=...)</span> 也是 per-instance new</div>
+          <div class="k">代码</div><div class="v"><span class="pill">env = Environment(workspace, command_timeout=COMMAND_TIMEOUT)</span></div>
+          <div class="k">设计要点</div><div class="v">workspace 作为构造参数显式传给 env,不 mutate 全局变量。verifier 拿 workspace 走 <code>env.workspace</code></div>
+          <div class="k">好处</div><div class="v">未来想 <code>--parallel</code> 同时跑多 case 不会撞全局变量</div>
         </div>
       </div>
     </div>
@@ -648,17 +1117,23 @@
     <div class="step">
       <div class="step-header">
         <div>
-          <p class="title">3. 双轨 MemoryManager (per-experiment)</p>
-          <p class="summary">实例化时传 global_facts_file 指向实验目录下的 facts 文件,启用双文件模式。</p>
+          <p class="title">3. 三文件 MemoryManager (per-experiment)</p>
+          <p class="summary">实例化时传 long_term_file + working_memory_file + global_facts_file,启用三文件分离布局。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">代码</div><div class="v"><span class="pill purple">MemoryManager(memory_file=ws/memory.json, global_facts_file=&lt;exp&gt;/mbpp_global_facts.json)</span></div>
-          <div class="k">_load() 行为</div><div class="v">先读 per-instance 拿 project_context + task_history,再读 global file 覆盖 self.data["facts"]</div>
-          <div class="k">效果</div><div class="v">这条 instance 启动时<b>能看到本次实验内所有前面 instance 留下的 facts</b>(不同实验之间互不影响)</div>
-          <div class="k">v3 → v4 区别</div><div class="v">facts 文件不再是 config 常量,而是 per-experiment 路径,runner 直接拼出来</div>
+          <div class="k">代码</div><div class="v">
+<pre style="margin: 4px 0;"><code>memory = MemoryManager(
+    long_term_file=os.path.join(workspace, "long_term_memory.json"),
+    working_memory_file=os.path.join(workspace, "working_memory.json"),
+    global_facts_file=facts_file,    # &lt;exp&gt;/mbpp_global_facts.json
+)</code></pre>
+          </div>
+          <div class="k">_load() 行为</div><div class="v">先读 long_term_file 拿 project_context + task_history,再读 global file <b>覆盖</b> self.data["facts"]</div>
+          <div class="k">效果</div><div class="v">这条 instance 启动时<b>能看到本次实验内所有前面 instance 留下的 facts</b>(不同实验目录互不影响)</div>
+          <div class="k">三文件分离</div><div class="v">working_memory.json 单独放任务级 event_log;long_term_memory.json 不带 event_log(避免数据冗余);global_facts.json 跨 case 共享</div>
         </div>
       </div>
     </div>
@@ -667,17 +1142,17 @@
     <div class="step">
       <div class="step-header">
         <div>
-          <p class="title">4. 复用 main.run_task</p>
-          <p class="summary">用 build_agents 一次性建好 planner + coder,然后调 run_task 跟 interactive main 完全一样。</p>
+          <p class="title">4. 调 engine.run_task</p>
+          <p class="summary">用 build_llm_nodes 一次性建好 planner + coder,从 prompt.md 读题面作为 user_prompt,然后调 engine.run_task。</p>
         </div>
         <div class="toggle"></div>
       </div>
       <div class="step-body">
         <div class="kv">
-          <div class="k">实例化</div><div class="v"><span class="pill">planner, coder = build_agents(env, memory, metrics)</span> — verifier 不再是 Agent</div>
+          <div class="k">实例化</div><div class="v"><span class="pill">planner, coder = build_llm_nodes(env, memory, metrics)</span> — verifier 不是 LLMNode,所以不返回</div>
           <div class="k">prompt</div><div class="v">从 <code>workspace/prompt.md</code> 读出来作为 user_prompt</div>
-          <div class="k">调用</div><div class="v"><span class="pill">run_task(prompt, planner, coder, memory, metrics)</span> — 注意签名没有 verifier</div>
-          <div class="k">tool 注入</div><div class="v">不再需要 <code>tool.set_memory_manager()</code> — tool dispatcher 直接接收 env / memory 作为参数</div>
+          <div class="k">调用</div><div class="v"><span class="pill">engine.run_task(prompt, planner, coder, memory, metrics)</span> — 签名没有 verifier 也没有 env(env 走 coder.env 复用)</div>
+          <div class="k">tool 注入</div><div class="v">不需要任何全局 set 函数 — tool dispatcher 直接接收 env / memory 作为参数</div>
         </div>
       </div>
     </div>
@@ -706,26 +1181,31 @@
       </div>
     </div>
 
-    <h3>双轨 memory 的设计原因</h3>
+    <h3>三文件 memory 的设计原因</h3>
     <div class="note-box bad">
-      <b>per-instance memory 在 benchmark 模式下让 long-term memory 完全失效</b><br><br>
-      每条 MBPP instance 都有自己的 memory.json,跑 mbpp_0602 时 task_history 从 [] 开始,
-      跑 mbpp_0603 时又是新的 memory.json,facts 永远从 0 开始,从来不会 reinforce。
-      设计文档里的 confidence / reinforce_count / grace period 全部形同虚设。
+      <b>纯 per-instance memory 在 benchmark 模式下让 long-term memory 完全失效</b><br><br>
+      如果每条 MBPP instance 都只有自己的 memory 文件,facts 永远从 0 开始,
+      跨 case 的 reinforce 不会发生,confidence / reinforce_count / grace period 全部形同虚设。
+      因此采用"per-case 文件 + 实验级 global facts"的三文件布局。
     </div>
 
     <table>
       <thead><tr><th>存储</th><th>内容</th><th>目的</th></tr></thead>
       <tbody>
         <tr>
-          <td><code>Execution/&lt;exp&gt;/single_case_details/mbpp_xxxx/memory.json</code></td>
-          <td>project_context + task_history</td>
-          <td>看每条 instance 怎么错的、为什么错(便于 debug)</td>
+          <td><code>Execution/&lt;exp&gt;/single_case_details/&lt;case&gt;/working_memory.json</code></td>
+          <td>本 task 完整 event_log + plan + candidate_facts</td>
+          <td>debug 回放;每个 task 独立的"思考过程"快照</td>
+        </tr>
+        <tr>
+          <td><code>Execution/&lt;exp&gt;/single_case_details/&lt;case&gt;/long_term_memory.json</code></td>
+          <td>project_context + task_history(无 event_log)+ 本 case 学的 facts</td>
+          <td>看每条 instance 怎么错的、为什么错(便于 debug),case 自己的"档案"</td>
         </tr>
         <tr>
           <td><code>Execution/&lt;exp&gt;/mbpp_global_facts.json</code></td>
-          <td>本次实验内所有 instance 共享的 facts</td>
-          <td>让 reinforce 真的能跨 instance 发生 (不同 exp 之间隔离)</td>
+          <td>本次实验内所有 instance 共享的 facts(confidence 累积)</td>
+          <td>让 reinforce 真的能跨 instance 发生(不同 exp 之间隔离)</td>
         </tr>
       </tbody>
     </table>
@@ -786,8 +1266,8 @@
             <span class="pill">git checkout base_commit</span>
             <span class="pill">docker pull swebench/sweb.eval.x86_64.{instance_id}:latest</span>
           </div>
-          <div class="k">test_command</div><div class="v">把 <code>docker run --rm -v ws:/testbed image bash -c "..."</code> 整段塞到 memory 的 test_command 字段</div>
-          <div class="k">run 阶段</div><div class="v">扫 <code>&lt;exp&gt;/single_case_details/*</code>,逐条 mutate config.WORKSPACE,调 <code>run_task()</code>,verifier 拿到 docker test_command 后 SubprocessRunner 直接跑</div>
+          <div class="k">test_command</div><div class="v">把 <code>docker run --rm -v ws:/testbed image bash -c "..."</code> 整段塞到 long_term_memory.json 的 test_command 字段</div>
+          <div class="k">run 阶段</div><div class="v">扫 <code>&lt;exp&gt;/single_case_details/*</code>,逐条新建 Environment(workspace) + MemoryManager,调 <code>engine.run_task()</code>,verifier 拿到 docker test_command 后 env.run_command 直接跑(整个 docker 调用就是普通 subprocess)</div>
           <div class="k">rolling cleanup</div><div class="v">每条跑完后 <span class="pill">docker rmi</span> 删掉这条 instance 的镜像,节省磁盘</div>
           <div class="k">实验目录</div><div class="v">跟 MBPP 一样: <code>Execution/&lt;exp&gt;/{single_case_details, swebench_global_facts.json, swebench_exp_final_results.json}</code></div>
         </div>

@@ -53,7 +53,7 @@ VERIFIER_OUTPUT_MAX_CHARS = 4000
 # ---------------------------------------------------------------------------
 # Memory
 # ---------------------------------------------------------------------------
-MAX_WORKING_OBSERVATIONS = 20
+MAX_WORKING_OBSERVATIONS = 30
 WORKING_OBSERVATION_MAX_CHARS = 500
 FACT_INITIAL_CONFIDENCE = 0.0
 FACT_REINFORCE_DELTA = 0.2

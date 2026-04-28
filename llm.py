@@ -1,75 +1,85 @@
-"""LLM client. Single provider: OpenRouter (OpenAI-compatible API)."""
+"""LLM client for OpenRouter (chat completions API).
+
+OpenRouter speaks the OpenAI chat-completions wire format, so we POST a JSON
+payload directly with `requests`. No SDK dependency.
+"""
 
 import json
 import time
-from typing import Optional
 
-from openai import OpenAI
+import requests
 
 from config import MODEL, API_KEY, BASE_URL
 
 
-_client: Optional[OpenAI] = None
-
-
-def _get_client() -> OpenAI:
-    """Lazy client init so importing llm.py doesn't crash when env isn't set yet."""
-    global _client
-    if _client is None:
-        if not API_KEY:
-            raise RuntimeError(
-                "OPENROUTER_API_KEY is not set. "
-                "Export it before running, e.g. `export OPENROUTER_API_KEY=...`."
-            )
-        _client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-    return _client
+_CHAT_COMPLETIONS_URL = f"{BASE_URL}/chat/completions"
+_REQUEST_TIMEOUT_SECONDS = 120
 
 
 def chat(messages: list, system_prompt: str, tools: list) -> dict:
     """One LLM round-trip. Returns text, tool_calls, tokens, latency."""
-    full_messages = _to_openai_messages(messages, system_prompt)
-    openai_tools = _to_openai_tools(tools) if tools else None
+    if not API_KEY:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set. "
+            "Export it before running, e.g. `export OPENROUTER_API_KEY=...`."
+        )
 
-    kwargs = {"model": MODEL, "messages": full_messages}
+    payload = {
+        "model": MODEL,
+        "messages": _to_openai_messages(messages, system_prompt),
+    }
+    openai_tools = _to_openai_tools(tools) if tools else None
     if openai_tools:
-        kwargs["tools"] = openai_tools
+        payload["tools"] = openai_tools
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+    }
 
     t_start = time.perf_counter()
-    response = _get_client().chat.completions.create(**kwargs)
+    response = requests.post(
+        _CHAT_COMPLETIONS_URL,
+        headers=headers,
+        json=payload,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
     latency = (time.perf_counter() - t_start) * 1000
 
-    msg = response.choices[0].message
+    response.raise_for_status()
+    data = response.json()
+
+    msg = data["choices"][0]["message"]
+    raw_tool_calls = msg.get("tool_calls") or []
+
     tool_calls = []
-    if msg.tool_calls:
-        for tc in msg.tool_calls:
-            # The LLM occasionally outputs malformed JSON for tool arguments
-            # (especially when content is very long). Don't crash the run —
-            # surface the parse error as a synthetic arg dict so the dispatcher
-            # can return an error message and let the LLM retry.
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError as e:
-                args = {
-                    "_parse_error": (
-                        f"JSON decode failed at position {e.pos}: {e.msg}. "
-                        f"raw arguments length={len(tc.function.arguments)}"
-                    )
-                }
-            tool_calls.append({
-                "name": tc.function.name,
-                "args": args,
-                "id": tc.id,
-            })
+    for tc in raw_tool_calls:
+        # OpenRouter occasionally returns malformed JSON for tool arguments
+        # (especially when content is very long). Don't crash the run —
+        # surface the parse error as a synthetic arg dict so the dispatcher
+        # can return an error message and let the LLM retry.
+        raw_args = tc["function"]["arguments"]
+        try:
+            args = json.loads(raw_args)
+        except json.JSONDecodeError as e:
+            args = {
+                "_parse_error": (
+                    f"JSON decode failed at position {e.pos}: {e.msg}. "
+                    f"raw arguments length={len(raw_args)}"
+                )
+            }
+        tool_calls.append({
+            "name": tc["function"]["name"],
+            "args": args,
+            "id": tc["id"],
+        })
 
-    usage = response.usage
-    input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-    output_tokens = getattr(usage, "completion_tokens", 0) or 0
-
+    usage = data.get("usage") or {}
     return {
-        "text": msg.content or "",
+        "text": msg.get("content") or "",
         "tool_calls": tool_calls,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
+        "input_tokens": usage.get("prompt_tokens", 0) or 0,
+        "output_tokens": usage.get("completion_tokens", 0) or 0,
         "latency": latency,
     }
 

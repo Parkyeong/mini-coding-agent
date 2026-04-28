@@ -1,8 +1,12 @@
 """Coder role: prompt + working-memory snapshot injection.
 
-The actual LLM + tool loop runs in Agent. main.py constructs a coder Agent
-with PROMPT and the FS/shell tools, and calls run_coder(agent, step, memory)
+The actual LLM + tool loop runs in an LLMNode instance configured for this
+role. engine.build_llm_nodes constructs the LLMNode with PROMPT below + the
+FS/shell tools; then engine.run_task calls run_coder(node, step, memory)
 for each plan step.
+
+This module is config + helpers, not a class. The "coder" runtime object is
+the LLMNode instance built in engine.py.
 """
 
 PROMPT = """
@@ -45,6 +49,6 @@ def build_input(step: str, memory) -> str:
     return f"{snapshot}\n\n current step:{step}"
 
 
-def run_coder(agent, step: str, memory) -> dict:
-    agent.reset_message()
-    return agent.run(build_input(step, memory))
+def run_coder(node, step: str, memory) -> dict:
+    node.reset_message()
+    return node.run(build_input(step, memory))

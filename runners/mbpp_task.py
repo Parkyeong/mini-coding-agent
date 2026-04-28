@@ -6,7 +6,9 @@ Each experiment lives under WORKSHOP/<exp_name>/, fully self-contained:
       <exp_name>/
         single_case_details/             <- per-case workspaces
           mbpp_0011/
-            prompt.md, solution.py, test_solution.py, memory.json
+            prompt.md, solution.py, test_solution.py
+            long_term_memory.json        <- project_context + task_history + this case's facts
+            working_memory.json          <- per-task event_log + plan + candidate_facts (written at end_task)
           mbpp_0012/
             ...
         mbpp_global_facts.json           <- facts shared across this run's cases
@@ -40,10 +42,9 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-import config as config_module
 from config import WORKSHOP, ENABLE_METRICS, COMMAND_TIMEOUT, MODEL
+from engine import run_task, build_llm_nodes
 from environment import Environment
-from main import run_task, build_agents
 from memory import MemoryManager
 from metrics import MetricsTracker
 
@@ -97,7 +98,7 @@ def materialize_instance(cases_dir: str, task_id: int, text: str,
             f"The function name and signature must exactly match the assertions above.\n"
         )
 
-    memory = {
+    long_term = {
         "project_context": {
             "project_name": f"mbpp_{task_id:04d}",
             "workspace": workspace,
@@ -111,8 +112,8 @@ def materialize_instance(cases_dir: str, task_id: int, text: str,
         "task_history": [],
         "facts": [],
     }
-    with open(os.path.join(workspace, "memory.json"), "w", encoding="utf-8") as f:
-        json.dump(memory, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(workspace, "long_term_memory.json"), "w", encoding="utf-8") as f:
+        json.dump(long_term, f, indent=2, ensure_ascii=False)
 
     return workspace
 
@@ -155,18 +156,16 @@ def cmd_setup(args) -> None:
 
 def run_one(workspace: str, facts_file: str) -> dict:
     instance_name = os.path.basename(workspace)
-    # Override globals so all modules see the right workspace for this instance.
-    config_module.PROJECT_NAME = instance_name
-    config_module.WORKSPACE = workspace
 
     memory = MemoryManager(
-        memory_file=os.path.join(workspace, "memory.json"),
+        long_term_file=os.path.join(workspace, "long_term_memory.json"),
+        working_memory_file=os.path.join(workspace, "working_memory.json"),
         global_facts_file=facts_file,
     )
     metrics = MetricsTracker() if ENABLE_METRICS else None
     env = Environment(workspace, command_timeout=COMMAND_TIMEOUT)
 
-    planner, coder = build_agents(env, memory, metrics)
+    planner, coder = build_llm_nodes(env, memory, metrics)
 
     with open(os.path.join(workspace, "prompt.md"), "r", encoding="utf-8") as f:
         prompt = f.read()
