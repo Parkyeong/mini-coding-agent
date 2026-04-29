@@ -14,6 +14,7 @@ from config import (
     ENABLE_METRICS,
     MAX_RETRIES_PER_STEPS as MAX_RETRIES_PER_STEP,
     MAX_REPLANS,
+    SUMMARIZER_MODEL,
 )
 from environment import Environment
 from llm_node import LLMNode
@@ -23,10 +24,12 @@ import tools as Tools
 import planner as planner_role
 import coder as coder_role
 import verifier as verifier_role
+import summarizer as summarizer_role
 
 
 def run_task(user_prompt: str, planner: LLMNode, coder: LLMNode,
-             memory: MemoryManager, metrics: MetricsTracker = None) -> str:
+             summarizer: LLMNode, memory: MemoryManager,
+             metrics: MetricsTracker = None) -> str:
     """Plan -> execute -> verify -> retry / replan, for one user task."""
     task_id = memory.generate_task_id()
     working = memory.begin_task(task_id=task_id, user_prompt=user_prompt)
@@ -101,6 +104,26 @@ def run_task(user_prompt: str, planner: LLMNode, coder: LLMNode,
 
             if all_passed:
                 overall_passed = True
+
+                # Summarize the case before end_task so the resulting facts go
+                # through the standard candidate_facts -> promote pipeline.
+                # Fail-soft: a bad summary doesn't fail the task, just yields
+                # zero new facts for this case.
+                if summarizer is not None:
+                    try:
+                        new_facts = summarizer_role.summarize(
+                            summarizer, memory, env=coder.env,
+                        )
+                        wm = memory.get_working()
+                        if wm is not None:
+                            for f in new_facts:
+                                wm.add_candidate_fact(f["fact"], f["category"])
+                        if new_facts:
+                            print(f"Summarizer: {len(new_facts)} fact(s) extracted")
+                    except Exception as e:
+                        print(f"[warn] summarizer failed (non-fatal): "
+                              f"{type(e).__name__}: {e}")
+
                 print(f"PASSED ({total_attempts} attempts, {replans_used} replans)")
                 _print_metrics(metrics)
                 return f"Task completed: {n_steps} steps."
@@ -140,11 +163,12 @@ def _print_metrics(metrics):
 
 
 def build_llm_nodes(env: Environment, memory: MemoryManager,
-                    metrics: MetricsTracker = None) -> tuple[LLMNode, LLMNode]:
-    """Build the two LLM-driven role nodes (planner + coder). Verifier is a
-    plain function (no LLM, just pytest) so it isn't an LLMNode and isn't
-    returned here. Together with verifier and the rest of the system, these
-    nodes form the agent that engine.run_task orchestrates."""
+                    metrics: MetricsTracker = None
+                    ) -> tuple[LLMNode, LLMNode, LLMNode]:
+    """Build the three LLM-driven role nodes (planner + coder + summarizer).
+    Verifier is a plain function (no LLM, just pytest) so it isn't an LLMNode.
+    Together with verifier and the rest of the system, these nodes form the
+    agent that engine.run_task orchestrates."""
     planner = LLMNode(
         system_prompt=planner_role.PROMPT,
         role="planner",
@@ -160,4 +184,15 @@ def build_llm_nodes(env: Environment, memory: MemoryManager,
         memory=memory,
         metrics_tracker=metrics,
     )
-    return planner, coder
+    # Summarizer runs once at the end of a passed case to distill 1-2
+    # generalizable lessons. No tools — outputs JSON directly. Cheaper model
+    # is fine for this constrained extraction step.
+    summarizer = LLMNode(
+        system_prompt=summarizer_role.PROMPT,
+        role="summarizer",
+        max_steps=1,
+        memory=memory,
+        metrics_tracker=metrics,
+        model=SUMMARIZER_MODEL,
+    )
+    return planner, coder, summarizer

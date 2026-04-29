@@ -16,8 +16,13 @@ _CHAT_COMPLETIONS_URL = f"{BASE_URL}/chat/completions"
 _REQUEST_TIMEOUT_SECONDS = 120
 
 
-def chat(messages: list, system_prompt: str, tools: list) -> dict:
-    """One LLM round-trip. Returns text, tool_calls, tokens, latency."""
+def chat(messages: list, system_prompt: str, tools: list,
+         model: str = None) -> dict:
+    """One LLM round-trip. Returns text, tool_calls, tokens, latency.
+
+    `model` overrides the global config.MODEL — used when a particular role
+    (e.g. fact-dedup judge) wants a different/cheaper model than the main agent.
+    """
     if not API_KEY:
         raise RuntimeError(
             "OPENROUTER_API_KEY is not set. "
@@ -25,7 +30,7 @@ def chat(messages: list, system_prompt: str, tools: list) -> dict:
         )
 
     payload = {
-        "model": MODEL,
+        "model": model or MODEL,
         "messages": _to_openai_messages(messages, system_prompt),
     }
     openai_tools = _to_openai_tools(tools) if tools else None

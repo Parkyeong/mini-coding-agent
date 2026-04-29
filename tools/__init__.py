@@ -19,7 +19,12 @@ from tools.fs import (
     replace_in_file,
 )
 from tools.shell import run_command
-from tools.memory_tool import save_memory
+
+# tools/memory_tool.py (save_memory) is no longer wired into the agent.
+# Coder doesn't write facts mid-execution anymore — the dedicated summarizer
+# role distills 1-2 lessons at end-of-case from the full task trace. The
+# memory_tool.py file is kept around in case we ever want a "self-note"
+# tool again, but it isn't imported here.
 
 
 TOOL_DEFINITIONS = [
@@ -103,25 +108,6 @@ TOOL_DEFINITIONS = [
             "required": ["file_path", "old_text", "new_text"],
         },
     },
-    {
-        "name": "save_memory",
-        "description": (
-            "Record a single, generalizable lesson you've learned during this task. "
-            "IMPORTANT: do NOT dump raw file contents or task-specific details. "
-            "Compress your observation into ONE sentence that will help future tasks "
-            "in similar projects (e.g. 'this project uses pytest with -q' or "
-            "'auth tokens are stored in env var AUTH_TOKEN'). "
-            "The fact only becomes permanent if the current task passes verification."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "fact": {"type": "string", "description": "ONE sentence, already summarized and generalized by you."},
-                "category": {"type": "string", "description": "Short tag like 'testing', 'config', 'architecture', 'convention'."},
-            },
-            "required": ["fact", "category"],
-        },
-    },
 ]
 
 
@@ -135,11 +121,6 @@ _ENV_TOOLS = {
     "replace_in_file": replace_in_file,
 }
 
-# Tools that need memory (only save_memory).
-_MEMORY_TOOLS = {
-    "save_memory": save_memory,
-}
-
 
 def execute_tool(name: str, args: dict, *, env=None, memory=None) -> str:
     """Dispatch a tool call.
@@ -148,7 +129,7 @@ def execute_tool(name: str, args: dict, *, env=None, memory=None) -> str:
         name: tool name as defined in TOOL_DEFINITIONS.
         args: parsed JSON args from the LLM.
         env: Environment instance (required for fs/shell tools).
-        memory: MemoryManager (required for save_memory).
+        memory: kept for backward-compat; currently unused (no memory tools).
     """
     # llm.py wraps JSON parse errors as {"_parse_error": "..."} so the LLM
     # gets a clear message and can retry with valid arguments.
@@ -165,9 +146,6 @@ def execute_tool(name: str, args: dict, *, env=None, memory=None) -> str:
             if env is None:
                 return f"Error calling {name}: no environment configured for this agent."
             return _ENV_TOOLS[name](env, **args)
-
-        if name in _MEMORY_TOOLS:
-            return _MEMORY_TOOLS[name](memory, **args)
 
         return f"Tool '{name}' not found."
 

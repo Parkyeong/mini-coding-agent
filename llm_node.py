@@ -33,6 +33,7 @@ class LLMNode:
         env=None,
         memory=None,
         metrics_tracker: MetricsTracker = None,
+        model: str = None,
     ):
         self.system_prompt = system_prompt
         self.role = role
@@ -41,6 +42,9 @@ class LLMNode:
         self.env = env
         self.memory = memory
         self.metrics_tracker = metrics_tracker
+        # Optional per-node model override; None means use config.MODEL.
+        # Useful for cheaper auxiliary roles (e.g. fact-dedup judge).
+        self.model = model
         self.messages = []
 
     def run(self, input_text: str) -> dict:
@@ -56,6 +60,7 @@ class LLMNode:
                 messages=self.messages,
                 system_prompt=self.system_prompt,
                 tools=self.tools,
+                model=self.model,
             )
             total_input_tokens += response.get("input_tokens", 0)
             total_output_tokens += response.get("output_tokens", 0)

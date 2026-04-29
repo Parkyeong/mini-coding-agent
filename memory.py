@@ -179,10 +179,18 @@ class MemoryManager:
         long_term_file: str,
         working_memory_file: Optional[str] = None,
         global_facts_file: Optional[str] = None,
+        seed_facts: Optional[list] = None,
     ):
         self.long_term_file = long_term_file
         self.working_memory_file = working_memory_file
         self.global_facts_file = global_facts_file
+        # Read-only facts injected into planner context but never persisted.
+        # Used by the parallel runner: it snapshots the global pool before
+        # starting a case and passes that snapshot here, so the planner sees
+        # accumulated cross-case knowledge without this case being able to
+        # write back into the shared pool. The case's own newly learned facts
+        # still go to self.data["facts"] / long_term_memory.json as usual.
+        self.seed_facts: list = list(seed_facts or [])
 
         self.data = self._load()
         self._working: Optional[WorkingMemory] = None
@@ -379,8 +387,13 @@ class MemoryManager:
         if non_empty:
             parts.append("Project info:" + ",".join(f"{k}={v}" for k, v in non_empty.items()))
 
+        # Seed facts (read-only cross-case context, populated by parallel runner)
+        # are merged with this case's own learnings before ranking. Both flow
+        # through the same top-N filter — top facts win on confidence regardless
+        # of source.
+        candidate_facts = list(self.seed_facts) + list(self.data.get("facts", []))
         facts = sorted(
-            self.data.get("facts", []),
+            candidate_facts,
             key=lambda f: f.get("confidence", 0),
             reverse=True,
         )[:max_facts]
@@ -413,59 +426,131 @@ class MemoryManager:
 # Cross-case merge — used by parallel runners
 # ---------------------------------------------------------------------------
 
-def merge_facts_into_global(local_fact_files: list[str], global_facts_file: str) -> dict:
+def add_facts_to_pool(pool: list[dict], facts: list[dict],
+                       dedup_node=None) -> int:
+    """Stream new `facts` into `pool` with optional LLM-based dedup.
+
+    Used both by the file-based `merge_facts_into_global` and by the parallel
+    runner during its rolling per-batch merge. Mutates `pool` in place.
+    Returns the count of facts that were judged equivalent to existing entries
+    (i.e. reinforced rather than added).
+
+    Does NOT apply pool size cap — caller decides via `cap_pool` whether/when
+    to trim.
+    """
+    dedup_hits = 0
+    for fact in facts:
+        text = (fact.get("fact") or "").strip()
+        if not text:
+            continue
+
+        pos = 0
+        if dedup_node is not None and pool:
+            from dedup import find_equivalent
+            pos = find_equivalent(dedup_node, text, [f["fact"] for f in pool])
+
+        if pos > 0:
+            existing = pool[pos - 1]
+            existing["reinforce_count"] = existing.get("reinforce_count", 0) + 1
+            existing["confidence"] = min(
+                existing.get("confidence", 0) + FACT_REINFORCE_DELTA,
+                FACT_MAX_CONFIDENCE,
+            )
+            src = fact.get("source_task_id")
+            if src and src not in existing.setdefault("reinforced_by", []):
+                existing["reinforced_by"].append(src)
+            existing["last_reinforced_at"] = datetime.now().isoformat(timespec='seconds')
+            dedup_hits += 1
+        else:
+            merged = dict(fact)
+            merged.setdefault("reinforced_by", [merged.get("source_task_id", "?")])
+            merged["reinforce_count"] = 0
+            merged["confidence"] = FACT_INITIAL_CONFIDENCE
+            pool.append(merged)
+    return dedup_hits
+
+
+def cap_pool(pool: list[dict], max_facts: int) -> int:
+    """Trim `pool` to `max_facts` entries, keeping highest reinforce_count
+    (ties broken by confidence). Returns count evicted. Mutates pool in place.
+
+    Tied to MAX_MEMORY_FACTS in config — used after each merge so the global
+    pool stays bounded throughout the run, not just at the end.
+    """
+    if not max_facts or len(pool) <= max_facts:
+        return 0
+    pool.sort(key=lambda f: (
+        -(f.get("reinforce_count", 0) or 0),
+        -(f.get("confidence", 0) or 0),
+    ))
+    evicted = len(pool) - max_facts
+    del pool[max_facts:]
+    return evicted
+
+
+def merge_facts_into_global(local_fact_files: list[str], global_facts_file: str,
+                            dedup_node=None, max_facts: Optional[int] = None) -> dict:
     """Aggregate per-case facts into a single global pool.
 
     Used after a parallel run, where each case wrote its facts into its own
     long_term_memory.json (in single-file mode) instead of contending for a
-    shared global file. This function reproduces the same dedup-and-reinforce
+    shared global file. This function reproduces the dedup-and-reinforce
     semantics that _promote_fact would have applied if cases ran sequentially.
+
+    Dedup is delegated entirely to the LLM judge (`dedup_node`). String-level
+    normalization (lowercase + whitespace collapse) is too coarse to detect
+    paraphrases — most real duplicates in the pool are differently worded
+    versions of the same fact ("uses pytest -q" vs "tests run quietly via
+    pytest -q"), which string normalize cannot match. The LLM call is cheap
+    enough (~$0.0002 per fact with gpt-4.1-mini) that prefiltering is not
+    worth the complexity. If `dedup_node=None`, no dedup is performed and
+    every fact is added as novel.
 
     Args:
       local_fact_files: paths to each case's long_term_memory.json
       global_facts_file: target path for the merged pool
+      dedup_node:        optional LLMNode for semantic-equivalence judgment
 
     Returns:
-      {"facts": [...], "stats": {"sources": N, "raw": M, "merged": K}}
+      {"facts": [...], "stats": {"sources", "raw", "merged",
+                                 "dedup_hits", "dedup_method"}}
     """
     pool: list[dict] = []
-    by_norm: dict[str, dict] = {}
     raw_count = 0
     sources = 0
+    dedup_hits = 0
 
+    total_cases = sum(1 for p in local_fact_files if os.path.exists(p))
+    case_idx = 0
     for path in local_fact_files:
         if not os.path.exists(path):
             continue
         sources += 1
+        case_idx += 1
+        case_id = os.path.basename(os.path.dirname(path))
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except Exception:
             continue
-        for fact in data.get("facts", []) or []:
-            raw_count += 1
-            norm = _normalize_fact(fact.get("fact", ""))
-            if not norm:
-                continue
-            existing = by_norm.get(norm)
-            if existing is None:
-                # Copy so we don't mutate the source case's record.
-                merged = dict(fact)
-                merged.setdefault("reinforced_by", [merged.get("source_task_id", "?")])
-                merged["reinforce_count"] = 0
-                merged["confidence"] = FACT_INITIAL_CONFIDENCE
-                by_norm[norm] = merged
-                pool.append(merged)
-            else:
-                existing["reinforce_count"] = existing.get("reinforce_count", 0) + 1
-                existing["confidence"] = min(
-                    existing.get("confidence", 0) + FACT_REINFORCE_DELTA,
-                    FACT_MAX_CONFIDENCE,
-                )
-                src = fact.get("source_task_id")
-                if src and src not in existing.setdefault("reinforced_by", []):
-                    existing["reinforced_by"].append(src)
-                existing["last_reinforced_at"] = datetime.now().isoformat(timespec='seconds')
+        case_facts = data.get("facts", []) or []
+        before_pool = len(pool)
+        before_hits = dedup_hits
+        dedup_hits += add_facts_to_pool(pool, case_facts, dedup_node)
+        case_added = len(pool) - before_pool
+        case_deduped = dedup_hits - before_hits
+        raw_count += len(case_facts)
+
+        # Progress log per case — keeps the user oriented during the slow LLM
+        # dedup loop. flush=True to bypass any output buffering.
+        print(
+            f"  [{case_idx:>3}/{total_cases}] {case_id}: "
+            f"+{case_added} new, {case_deduped} deduped "
+            f"| pool={len(pool)}, total dedup_hits={dedup_hits}",
+            flush=True,
+        )
+
+    evicted = cap_pool(pool, max_facts) if max_facts else 0
 
     payload = {
         "facts": pool,
@@ -477,5 +562,12 @@ def merge_facts_into_global(local_fact_files: list[str], global_facts_file: str)
 
     return {
         "facts": pool,
-        "stats": {"sources": sources, "raw": raw_count, "merged": len(pool)},
+        "stats": {
+            "sources": sources,
+            "raw": raw_count,
+            "merged": len(pool),
+            "dedup_hits": dedup_hits,
+            "evicted": evicted,
+            "dedup_method": "llm" if dedup_node else "none",
+        },
     }

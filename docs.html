@@ -348,7 +348,6 @@
   <div class="tabs">
     <button class="tab active" data-view="structure">Structure</button>
     <button class="tab" data-view="components">Components</button>
-    <button class="tab" data-view="dataset">Dataset</button>
   </div>
 </div>
 
@@ -403,20 +402,42 @@
           </div>
         </div>
       </div>
-      <div class="flow-down">所有 step 过完 / 彻底失败</div>
+      <div class="flow-down">所有 step 过完 (overall_passed=True)</div>
+
+      <div class="layer-row cols-1">
+        <div class="layer-box role">
+          <div class="layer-name">阶段 5 · summarizer 提炼经验(只在 passed)</div>
+          <div class="layer-sub">
+            engine 调 <span class="pill">summarizer.summarize(node, memory, env)</span> → build_case_trace 拼 markdown(prompt + plan + 动作时间线 + 最终 solution.py)→ summarizer LLMNode 跑一次(gpt-4o-mini, max_steps=1, no tools)→ parse JSON → 1-2 条 project-level fact → <span class="pill purple">working.add_candidate_fact()</span>
+          </div>
+        </div>
+      </div>
+      <div class="flow-down">end_task</div>
 
       <div class="layer-row cols-1">
         <div class="layer-box memory">
-          <div class="layer-name">阶段 5 · end_task 收尾</div>
-          <div class="layer-sub">working_memory.json 落盘 · task_history 追加 · passed=True 时 candidate_facts 升级到 long-term + global facts</div>
+          <div class="layer-name">阶段 6 · end_task 收尾</div>
+          <div class="layer-sub">working_memory.json 落盘 · task_history 追加 · passed=True 时 candidate_facts 升级到本 case 的 long_term_memory.json(并发模式不写 global file)</div>
+        </div>
+      </div>
+
+      <div class="flow-down">runner 在 batch 边界(每 batch_size 个 case 完成)</div>
+
+      <div class="layer-row cols-1">
+        <div class="layer-box role">
+          <div class="layer-name">阶段 7 · dedup + global pool 更新</div>
+          <div class="layer-sub">
+            runner 主线程调 <span class="pill">memory.add_facts_to_pool(pool, facts, dedup_node)</span> 流式合并 batch 内 facts → dedup_node(gpt-4.1-mini)逐条判语义等价(同义改写 reinforce 已有,novel 加入)→ <span class="pill">cap_pool(MAX_MEMORY_FACTS=40)</span> 按 reinforce_count 留 top 40 → 下一 batch 起跑前 worker 读 pool snapshot 作 seed
+          </div>
         </div>
       </div>
 
     </div>
 
     <div class="note-box">
-      <b>关键认知</b>:engine 是流程总管,决定 retry / replan / 结束。coder <b>不直接看</b> verifier 输出 —— verdict 回到 engine,engine 把 fix_suggestion 拼进下一轮 prompt 给 coder。一句话:<br>
-      <b>"engine 调度,planner / coder 想,tools / test_runner 翻译,env 干活,memory 旁观记录。"</b>
+      <b>关键认知</b>:engine 是流程总管,决定 retry / replan / 结束。coder <b>不直接看</b> verifier 输出 —— verdict 回到 engine,engine 把 fix_suggestion 拼进下一轮 prompt 给 coder。<br>
+      <b>三层反馈</b>:① coder 看 verifier 失败信息(同 step retry)② planner 看整轮失败重新出 plan ③ summarizer/dedup 跨 case 积累经验给下一 case 的 planner。<br>
+      一句话:<b>"engine 调度,planner / coder 想,verifier 验,summarizer 总结,dedup 判等价,tools / test_runner 翻译,env 干活,memory 旁观记录。"</b>
     </div>
 
 
@@ -535,7 +556,7 @@
           <div class="k">调用链</div><div class="v"><span class="pill">coder_role.run_coder(coder, step, memory)</span> → <span class="pill">LLMNode.run</span></div>
           <div class="k">注入 snapshot</div><div class="v"><span class="pill purple">memory.get_working().snapshot_for_coder()</span> 拼到 user 消息前面 — 包含 plan / 之前 step 的 observations / files_changed</div>
           <div class="k">LLM loop</div><div class="v"><span class="pill">LLMNode.run()</span> 内部循环最多 <code>MAX_STEPS=8</code> 步,每步 <span class="pill red">llm.chat()</span> → 解析 tool_calls → <span class="pill">execute_tool(name, args, env, memory)</span></div>
-          <div class="k">tool 调度</div><div class="v">tool 函数纯净,只依赖 <span class="pill">Environment</span> 和(对 save_memory 而言)memory,不写 working memory</div>
+          <div class="k">tool 调度</div><div class="v">tool 函数纯净,只依赖 <span class="pill">Environment</span>,不写 working memory(coder 不再有 save_memory tool;facts 由 summarizer 在 case 末尾统一提炼)</div>
           <div class="k">事件落地</div><div class="v">每次 LLM 往返 / tool_call / tool_result / final text 都由 LLMNode 循环 push 到 <span class="pill purple">working.event_log</span></div>
           <div class="k">派生视图</div><div class="v">
             <span class="pill green">working.observations() — 由 event_log 中的 read_file/list_dir tool_result 派生</span>
@@ -647,15 +668,28 @@
       <div class="layer-row cols-3">
         <div class="layer-box role">
           <div class="layer-name">planner.py</div>
-          <div class="layer-sub">LLMNode (max_steps=1, 无 tools) — 拆任务为 step 列表,只调一次 LLM</div>
+          <div class="layer-sub">LLMNode (max_steps=1, 无 tools, gpt-4o-mini) — 拆任务为 step 列表,只调一次 LLM</div>
         </div>
         <div class="layer-box role">
           <div class="layer-name">coder.py</div>
-          <div class="layer-sub">LLMNode (max_steps=8, 带 tools) — ReAct 循环,逐步执行 plan 中的某一步</div>
+          <div class="layer-sub">LLMNode (max_steps=8, 带 tools, gpt-4o-mini) — ReAct 循环,逐步执行 plan 中的某一步</div>
         </div>
         <div class="layer-box role">
           <div class="layer-name">verifier.py</div>
           <div class="layer-sub">纯函数,不调 LLM — 跑 pytest 看 returncode,返回 verdict dict</div>
+        </div>
+      </div>
+
+      <div class="flow-down">on pass: extract lessons / on merge: dedup</div>
+
+      <div class="layer-row cols-2">
+        <div class="layer-box role">
+          <div class="layer-name">summarizer.py</div>
+          <div class="layer-sub">LLMNode (max_steps=1, 无 tools, gpt-4o-mini) — 在 case passed 后跑一次,从全 task trace 提炼 1-2 条 project-level fact 输出 JSON</div>
+        </div>
+        <div class="layer-box role">
+          <div class="layer-name">dedup.py</div>
+          <div class="layer-sub">LLMNode (max_steps=1, 无 tools, gpt-4.1-mini) — runner 在 batch 边界对 facts 流式调用,判语义等价(给 add_facts_to_pool 做依赖注入)</div>
         </div>
       </div>
 
@@ -713,8 +747,7 @@
             <span class="pill purple">llm_node.py LLMNode.run()</span> 当 LLM 返回 tool_calls 时,通过 <span class="pill">execute_tool(name, args, env, memory)</span> dispatch
           </div>
           <div class="k">它调用谁</div><div class="v">
-            <span class="pill green">environment.py</span> 的 read/write/list/walk/run_command (大部分 fs/shell tools)<br>
-            <span class="pill orange">memory.py</span> WorkingMemory.add_candidate_fact (只有 save_memory tool)
+            <span class="pill green">environment.py</span> 的 read/write/list/walk/run_command (所有 fs/shell tools)
           </div>
           <div class="k">输入</div><div class="v">tool 名字 + args dict (llm.py 已把 OpenRouter 返回的 JSON 字符串解析过了)</div>
           <div class="k">输出</div><div class="v">单个字符串(LLM 友好的格式),如 <code>"[FILE]solution.py\n[FILE]prompt.md"</code> 或 <code>"File not found"</code></div>
@@ -723,7 +756,7 @@
             <span class="pill">tools/__init__.py</span> TOOL_DEFINITIONS schema + execute_tool dispatcher<br>
             <span class="pill">tools/fs.py</span> read/write/list/search/replace<br>
             <span class="pill">tools/shell.py</span> run_command<br>
-            <span class="pill">tools/memory_tool.py</span> save_memory(唯一吃 memory 的工具)
+            <span class="pill orange">tools/memory_tool.py</span> save_memory — <b>已 dead code</b>(coder 不再有此工具;facts 由独立的 summarizer role 在 case 末尾统一提炼。文件保留备用)
           </div>
           <div class="k">为什么单独抽一层</div><div class="v">tools/ 不应该 import subprocess / 知道 docker。哪天换 backend,tools/ 一行不用改</div>
         </div>
@@ -808,7 +841,7 @@
           <div class="k">谁创建</div><div class="v"><span class="pill purple">memory.begin_task(task_id, user_prompt)</span>,在 engine.run_task 入口调一次</div>
           <div class="k">谁写</div><div class="v">
             <span class="pill purple">agent loop</span> push event_log(llm_call / text / tool_call / tool_result)<br>
-            <span class="pill">save_memory tool</span> add_candidate_fact()<br>
+            <span class="pill">summarizer</span>(在 case 末尾,只在 passed 时)→ add_candidate_fact()<br>
             <span class="pill">engine</span> set_plan(plan_steps)
           </div>
           <div class="k">谁读</div><div class="v">
@@ -841,25 +874,104 @@
             <span class="pill">working_memory_file</span>(可选) ·
             <span class="pill">global_facts_file</span>(可选)
           </div>
+          <div class="k">构造参数(parallel runner)</div><div class="v">
+            <span class="pill">long_term_file</span>(必传) ·
+            <span class="pill">working_memory_file</span>(可选) ·
+            <span class="pill">global_facts_file=None</span>(并发模式下) ·
+            <span class="pill purple">seed_facts=&lt;snapshot&gt;</span>(只读 cross-case 上下文)
+          </div>
           <div class="k">_load() 行为</div><div class="v">
-            1. 读 long_term_file → project_context + task_history + facts<br>
-            2. 若有 global_facts_file → 用 global facts <b>覆盖</b> self.data["facts"]<br>
-            (这是"跨 case 记忆流动"的关键:每个 case 启动时看到的就是上一个 case 留下的 global pool)
+            1. 读 long_term_file → project_context + task_history + facts(空,因为 case 刚开始)<br>
+            2. 若有 global_facts_file 用 global facts 覆盖 self.data["facts"](当前 parallel runner 不用这条路径)<br>
+            3. seed_facts 单独存为 self.seed_facts,<b>read-only,不持久化</b>
           </div>
           <div class="k">_save() 行为</div><div class="v">
-            <b>dual-file mode</b>:全部 facts → global file;long_term file 只保留<b>本 case 学的 facts</b>(按 source_task_id 过滤)<br>
-            <b>single-file mode</b>:全部数据 → long_term file
+            写 long_term_memory.json:project_context + task_history + 本 case 学到的 facts(seed_facts 不写回)<br>
+            <b>不动 global file</b> —— global pool 由 runner 在 batch 边界统一更新
           </div>
-          <div class="k">facts 流转链</div><div class="v">
-            coder 调 save_memory tool → WorkingMemory.candidate_facts<br>
-            → end_task 时若 passed → <span class="pill purple">_promote_fact()</span> → self.data["facts"]<br>
-            → _save() → 同时写 per-case(filtered)+ global(full)
+          <div class="k">facts 流转链(parallel runner)</div><div class="v">
+            <span class="pill">summarizer</span> case 末尾跑一次(passed 时)→ add_candidate_fact()<br>
+            → end_task 时 <span class="pill purple">_promote_fact()</span> → self.data["facts"]<br>
+            → _save() → 写 long_term_memory.json(per-case)<br>
+            → 每完成 batch_size 个 case → runner 调 <span class="pill">add_facts_to_pool</span>(LLM dedup) + <span class="pill">cap_pool</span>(MAX_MEMORY_FACTS=40)<br>
+            → 写 mbpp_global_facts.json
           </div>
-          <div class="k">读时谁用</div><div class="v">planner 启动前 <span class="pill">memory.get_context_for_planner()</span> → 按 confidence 排序的 top-N facts + project_context + 最近 task_history → 拼成 prompt 段落</div>
+          <div class="k">读时谁用</div><div class="v">planner 启动前 <span class="pill">memory.get_context_for_planner()</span> → 把 seed_facts(跨 case)+ self.data["facts"](本 case)合并 → 按 confidence top-N → 拼 prompt 段落</div>
           <div class="k">confidence 累积</div><div class="v">
             新 fact:confidence = 0(<code>FACT_INITIAL_CONFIDENCE</code>)<br>
-            重复出现:每次 +0.2,封顶 1.0(<code>FACT_REINFORCE_DELTA / FACT_MAX_CONFIDENCE</code>)<br>
-            evict 策略:超过 <code>MAX_MEMORY_FACTS</code> 时按 (in_grace_period, score, age) 淘汰
+            被 dedup_node 判为已有 fact 的同义改写:每次 +0.2,封顶 1.0(<code>FACT_REINFORCE_DELTA / FACT_MAX_CONFIDENCE</code>)<br>
+            cap 策略:每次 batch merge 后 <code>cap_pool</code> 按 reinforce_count desc 留 top <code>MAX_MEMORY_FACTS=40</code>
+          </div>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ====== Summarizer / Dedup roles ====== -->
+    <h2>Summarizer 与 Dedup(辅助 role)</h2>
+    <p class="lead">
+      两个独立的 LLM role,**不参与解题**,但管 facts pool 的"质量"。
+      <b>summarizer</b> 写(case 末尾从 trace 提炼经验);<b>dedup</b> 判等价(merge 时判语义重复)。
+      跟 planner / coder / verifier 一样是 role 文件(PROMPT + helper),不是 memory 的一部分 —— 这样换 PROMPT / 换模型都不动 memory.py。
+    </p>
+
+    <div class="step">
+      <div class="step-header">
+        <div>
+          <p class="title">summarizer.py — 经验提炼(case 末尾跑一次)</p>
+          <p class="summary">取代了原来 coder 的 save_memory tool。看全 task trace,以 "agent 整体视角" 写 1-2 条 project-level fact。</p>
+        </div>
+        <div class="toggle"></div>
+      </div>
+      <div class="step-body">
+        <div class="kv">
+          <div class="k">谁调用</div><div class="v"><span class="pill purple">engine.run_task()</span> 在 <code>overall_passed=True</code> 之后、<code>memory.end_task()</code> 之前。<b>失败 case 不调用</b></div>
+          <div class="k">输入</div><div class="v">
+            <span class="pill">summarizer.build_case_trace(memory, env)</span> 拼出的 markdown:<br>
+            ① 原始 prompt ② 最终 plan(含 replan 后的版本)③ 动作时间线(planner / coder / verifier 的 llm_call / tool_call / tool_result,关键失败也含)④ 最终 solution.py 内容<br>
+            动作 args / result 都按 80 / 240 字符截断,trace 整体几千 token 内
+          </div>
+          <div class="k">PROMPT</div><div class="v">"你审阅一个完成的 task 的全 trace,提炼 1-2 条 *项目级、可泛化* 经验。GOOD 例:'this project uses pytest -q --disable-warnings'。BAD 例:'case 0011 用 set 追踪重复字符'(任务特定)。输出纯 JSON 数组,无其他文字"</div>
+          <div class="k">LLM 调用</div><div class="v"><span class="pill">LLMNode (max_steps=1, 无 tools)</span>,模型 <code>SUMMARIZER_MODEL</code> 默认 <code>gpt-4o-mini</code>(跟主 agent 一致,~$0.0003/case)</div>
+          <div class="k">输出处理</div><div class="v">
+            <span class="pill purple">summarizer._strip_code_fences()</span> 去掉 ```json``` 包裹(LLM 偶尔会忽略 prompt 加上)<br>
+            <span class="pill purple">json.loads()</span> 解析 → 验证是 list of {fact, category} → cap 至 3 条<br>
+            <b>解析失败 fail-soft</b>:返回 [] 而不是抛错,task 仍算 passed(summarization 是 best-effort)
+          </div>
+          <div class="k">下一跳</div><div class="v">解析出的 facts 逐条调 <span class="pill">working.add_candidate_fact(fact, category)</span> → 走 end_task 的 _promote_fact 路径升级到 long_term_memory.json</div>
+          <div class="k">为什么独立成 role</div><div class="v">
+            <b>视角错配</b>:coder 视角写的 fact(实现细节)≠ planner 消费的 fact(项目约定)。让独立 role 用 "整 agent 视角" 提炼解决错配。<br>
+            <b>频率失控</b>:旧版 coder 平均 5-10 次 save_memory/case,新版固定 1-2 条/case。详见 designed.md §6.9
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-header">
+        <div>
+          <p class="title">dedup.py — 语义等价判等(batch merge 时调)</p>
+          <p class="summary">runner 把 batch 内 cases 学到的 facts 合并进 global pool 时,逐条问"这条等价于池子里第几条?"。返回 0(novel)或 1-N(reinforce 已有第 N 条)。</p>
+        </div>
+        <div class="toggle"></div>
+      </div>
+      <div class="step-body">
+        <div class="kv">
+          <div class="k">谁调用</div><div class="v"><span class="pill purple">memory.add_facts_to_pool(pool, facts, dedup_node)</span> 内部对每条新 fact 调一次 <span class="pill">dedup.find_equivalent(node, new_fact, [pool 里 fact 的文本])</span></div>
+          <div class="k">输入</div><div class="v">一条新 fact 的字符串 + 当前 pool 里所有 fact 的字符串列表</div>
+          <div class="k">PROMPT</div><div class="v">"判断 new fact 跟 EXISTING facts 中哪条语义等价(措辞不同但表达同一项目知识)。输出单个整数:0=novel,N=等价于第 N 条"</div>
+          <div class="k">LLM 调用</div><div class="v"><span class="pill">LLMNode (max_steps=1, 无 tools)</span>,模型 <code>DEDUP_MODEL</code> 默认 <code>gpt-4.1-mini</code>(比主 agent 便宜,~$0.0002/call)</div>
+          <div class="k">输出处理</div><div class="v">
+            <span class="pill purple">re.search(r"-?\d+", text)</span> 抓第一个整数 → 范围检查 [0, len(existing)]<br>
+            出错或越界 → 返回 0(当作 novel,defensive — 漏判 dedup 比误合并好)
+          </div>
+          <div class="k">为什么不用字符串归一化</div><div class="v">
+            实测 baseline 822 条 raw fact:string normalize(lowercase + 折叠空白)只抓到 42 条(5%)。<br>
+            真正的重复都是 paraphrase("uses pytest -q" vs "tests run quietly via pytest -q"),字面 normalize 完全无能为力。LLM 一次 ~$0.0002,跑全 baseline ~$0.30,简单粗暴
+          </div>
+          <div class="k">为什么是 role 不是 memory</div><div class="v">
+            dedup 跟"facts pool"紧耦合,但跟"memory 存储格式"无关。改 PROMPT / 换模型都不该动 memory.py。<br>
+            memory.py 暴露 <code>add_facts_to_pool(pool, facts, dedup_node)</code> 接口,dedup_node 由 runner 注入(依赖注入)。详见 designed.md §6.10
           </div>
         </div>
       </div>
@@ -933,467 +1045,6 @@
 
   </div>
 
-  <!-- ============================================================ -->
-  <!-- =========================  DATASET  ======================== -->
-  <!-- ============================================================ -->
-  <div class="view" id="dataset">
-
-    <h1>Experiment: first_test</h1>
-    <p class="lead">
-      实际跑出来的实验数据。<b>10 个 case(mbpp_0602–0608, 0610–0612)</b>,
-      模型 <code>openai/gpt-4.1-mini</code>,2026-04-28 20:53→21:10(共 17 分钟 8 秒)。
-      数据源:<code>Execution/first_test/</code> 下的 mbpp_exp_final_results.json + 每个 case 的 working_memory.json + long_term_memory.json + mbpp_global_facts.json。
-    </p>
-
-    <h2>Overview</h2>
-    <div class="layer-stack">
-      <div class="layer-row cols-3">
-        <div class="layer-box engine">
-          <div class="layer-name">10 / 10 passed</div>
-          <div class="layer-sub">pass@1 = 100%。所有 case 最终都拿到 returncode=0,平均每 case 6.7 次 attempts</div>
-        </div>
-        <div class="layer-box memory">
-          <div class="layer-name">568k / 27k tokens</div>
-          <div class="layer-sub">total input/output。平均 56.8k input + 2.7k output 每 case;<b>0603 单 case 烧了 180k input</b></div>
-        </div>
-        <div class="layer-box test">
-          <div class="layer-name">905s LLM 延迟</div>
-          <div class="layer-sub">所有 LLM 调用累计 ~15 分钟。每次 LLM 调用平均 2.7s;0603 一个 case 占 406s</div>
-        </div>
-      </div>
-      <div class="layer-row cols-3">
-        <div class="layer-box role">
-          <div class="layer-name">338 LLM calls</div>
-          <div class="layer-sub">planner=13(<span class="pill green">已被记录</span>) / coder=325 / verifier=0(verifier 不调 LLM,只读 TestRunResult 字段)</div>
-        </div>
-        <div class="layer-box tools">
-          <div class="layer-name">269 tool calls</div>
-          <div class="layer-sub">write_file:87 · run_command:85 · save_memory:59 · read_file:21 · replace_in_file:15 · list_dir:2</div>
-        </div>
-        <div class="layer-box memory">
-          <div class="layer-name">40 facts learned</div>
-          <div class="layer-sub">global pool 40 条;但 <b>0602/0603/0604 的 18 条 candidate fact 没合并进 global</b>(疑似 bug,见分析)</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="note-box">
-      <b>跟上一轮(first_run, 3 case)对比:</b>
-      pass@1 仍是 100%,而且 <b>verify→replan 路径首次被实测触发</b>(0603 重 plan 3 次,0602 重 plan 2 次,中间出现 SyntaxError / IndentationError / 答案错误 等多种失败,planner 真的把控制流接走了)。
-      planner LLM 调用 <b>现在也被记录了</b>(共 13 次,跟上一轮"已修复 engine.py"的预期一致)。
-      但 token 平均消耗放大:每 case 56.8k input,几乎是前一轮 23.9k 的两倍多——主要被 <b>0603 灾难场 + 0605 fact-spam</b> 拉高。
-    </div>
-
-    <h2>Per-Case 汇总</h2>
-    <table>
-      <thead>
-        <tr><th>case</th><th>题目</th><th>结果</th><th>plan</th><th>LLM</th><th>input</th><th>output</th><th>延迟</th><th>pytest 总/通</th><th>save_mem</th></tr>
-      </thead>
-      <tbody>
-        <tr><td><b>0602</b></td><td>first_repeated_char</td><td>✅</td><td>2</td><td>60</td><td>101.0k</td><td>3.0k</td><td>114.5s</td><td>18 / 12</td><td>10</td></tr>
-        <tr><td><b>0603</b></td><td>get_ludic <span class="pill orange">最难</span></td><td>✅</td><td>3</td><td>80</td><td>180.4k</td><td>11.4k</td><td>406.2s</td><td>21 / 5</td><td>5</td></tr>
-        <tr><td><b>0604</b></td><td>reverse_words <span class="pill green">最干净</span></td><td>✅</td><td>1</td><td>15</td><td>20.5k</td><td>0.9k</td><td>26.2s</td><td>3 / 3</td><td>3</td></tr>
-        <tr><td><b>0605</b></td><td>prime_num <span class="pill orange">fact 灾区</span></td><td>✅</td><td>1</td><td>52</td><td>77.7k</td><td>3.5k</td><td>100.3s</td><td>12 / 12</td><td>12</td></tr>
-        <tr><td><b>0606</b></td><td>radian_degree</td><td>✅</td><td>1</td><td>20</td><td>26.0k</td><td>0.9k</td><td>33.2s</td><td>5 / 5</td><td>5</td></tr>
-        <tr><td><b>0607</b></td><td>find_literals</td><td>✅</td><td>1</td><td>25</td><td>38.5k</td><td>1.8k</td><td>50.2s</td><td>6 / 5</td><td>5</td></tr>
-        <tr><td><b>0608</b></td><td>bell_Number</td><td>✅</td><td>1</td><td>21</td><td>29.0k</td><td>1.3k</td><td>42.5s</td><td>5 / 5</td><td>5</td></tr>
-        <tr><td><b>0610</b></td><td>remove_kth_element</td><td>✅</td><td>1</td><td>18</td><td>25.3k</td><td>1.3k</td><td>39.6s</td><td>4 / 4</td><td>4</td></tr>
-        <tr><td><b>0611</b></td><td>max_of_nth</td><td>✅</td><td>1</td><td>26</td><td>41.3k</td><td>1.9k</td><td>53.0s</td><td>6 / 5</td><td>5</td></tr>
-        <tr><td><b>0612</b></td><td>merge</td><td>✅</td><td>1</td><td>21</td><td>28.3k</td><td>1.2k</td><td>39.5s</td><td>5 / 5</td><td>5</td></tr>
-      </tbody>
-    </table>
-    <div class="note-box">
-      <b>三个明显异常点</b>:0603(180k token,触发 3 次 replan)/ 0605(12 次 save_memory,产了 11 条几乎一样的 pytest fact)/ 0604(15 LLM 一次过,理论最优样)。下面挑这三个详细看。
-    </div>
-
-    <h2>三个有代表性的 case 细节</h2>
-
-    <!-- ============ Case A: mbpp_0603 (灾难场 / replan demo) ============ -->
-    <div class="step open">
-      <div class="step-header">
-        <div>
-          <p class="title">mbpp_0603 — get_ludic(灾难场 / verify→replan 全程演示)</p>
-          <p class="summary">✅ passed · <b>3 plan iterations</b> · 80 LLM · 180.4k/11.4k tokens · 406s · pytest 21 次(<b>5 通过 / 16 失败</b>)</p>
-        </div>
-        <div class="toggle"></div>
-      </div>
-      <div class="step-body">
-
-        <h4>📝 Prompt</h4>
-<pre><code>Write a function to get all lucid numbers smaller than or equal to a given integer.
-
-assert get_ludic(10) == [1, 2, 3, 5, 7]
-assert get_ludic(25) == [1, 2, 3, 5, 7, 11, 13, 17, 23, 25]
-assert get_ludic(45) == [1, 2, 3, 5, 7, 11, 13, 17, 23, 25, 29, 37, 41, 43]</code></pre>
-
-        <h4>📋 三次 plan(verifier→replan 触发了两次)</h4>
-        <ol>
-          <li><b>Plan #1</b>(event 0):用 ludic sieve 算法实现 <code>get_ludic(n)</code> + pytest 跑测试</li>
-          <li><b>Plan #2</b>(event 122):重读 prompt,重新理解 ludic 数定义,改算法</li>
-          <li><b>Plan #3</b>(event 174):承认有 syntax / indent error,逐文件重写 + 跑测试</li>
-        </ol>
-
-        <h4>💻 最终 solution.py</h4>
-<pre><code>"""MBPP task -- implement the function described in prompt.md."""
-
-def get_ludic(n):
-    if n &lt; 1:
-        return []
-    candidates = list(range(2, n + 1))
-    ludics = [1]  # Start ludics list with 1
-    while candidates:
-        ludic = candidates.pop(0)
-        ludics.append(ludic)
-        candidates = [x for x in candidates if x % ludic != 0]
-    return ludics</code></pre>
-
-        <div class="note-box warn">
-          <b>实现观察</b>:这次的写法比 first_run 那次干净多了——没有"硬塞 [1] +"的丑陋 patch。但要注意,题目给的 assert(<code>get_ludic(45) == [...,11,13,17,23,25,...]</code>)其实是 <b>lucky number</b> 而不是 ludic number。LLM 在 plan #2 时已经发现"prompt 跟我以为的 ludic 数定义不一样",但生成的最终代码 <b>仍然是 lucky number sieve(过 prompt 的 assert 但跟 ludic 数学定义不符)</b>。LLM 的策略其实是"过题就行"。
-        </div>
-
-        <h4>📊 工具调用统计</h4>
-        <table>
-          <thead><tr><th>tool</th><th>次数</th><th>备注</th></tr></thead>
-          <tbody>
-            <tr><td>read_file</td><td>12</td><td><b>同一个文件来回读</b>;每读一次把内容塞回 prompt,这是 input 涨到 180k 的主因</td></tr>
-            <tr><td>write_file</td><td>24</td><td><b>solution.py / test_solution.py 反复改写</b>(包括踩到 SyntaxError / IndentationError 后的修复)</td></tr>
-            <tr><td>replace_in_file</td><td>10</td><td>多次 partial edit;部分失败(old_text 不匹配)</td></tr>
-            <tr><td>run_command (pytest)</td><td>21</td><td><b>5 通过 / 16 失败</b>。失败种类:答案错(13 次)+ SyntaxError(1)+ IndentationError(1)+ 其他(1)</td></tr>
-            <tr><td>save_memory</td><td>5</td><td>5 条都是 algorithm 类(ludic sieve 实现笔记)</td></tr>
-          </tbody>
-        </table>
-
-        <h4>📜 21 次 pytest 故事线(只列状态变化)</h4>
-<pre><code>#0  ✓ rc=0   ← 第一版意外通过(test_solution.py 自动生成的内容只有占位 assert)
-#1  ✗ rc=1   AssertionError: get_ludic(10) == [2,5,7]  期望 [1,2,3,5,7]
-#2  ✗ rc=2   SyntaxError: unterminated triple-quoted string ← coder 写代码时引号没闭
-#3  ✗ rc=1   答案 [1,2,5,7]  少了 3
-#4  ✓ rc=0   ★ 算法看似对了
-#5  ✗ rc=1   答案 [1]  ← 又退化了(coder 自己又改了一版)
-#6  ✗ rc=1   [1,2,5,7]
-#7  ✗ rc=1   [1,2,5,7]
-#8  rc=?     输出截断,实测过没过不明确
-#9  ✗ rc=1   [1]
-#10 rc=?     输出截断
-#11 rc=?     换 flag 跑 pytest -q --tb=short --maxfail=1
-#12 ✗ rc=1   [1,3,5,7]
-#13 ✗ rc=2   IndentationError ← write_file 写入时缩进错乱
-#14-17 ✗ rc=1  连续 4 次假设错误的实现
-#18 ✓ rc=0   ★ 第二次彻底通过(就是上面贴的最终版)
-#19 ✓ rc=0   ★ 多余确认 1
-#20 ✓ rc=0   ★ 多余确认 2 → end_task</code></pre>
-
-        <div class="note-box bad">
-          <b>这是 token 消耗冠军</b>(180.4k input)。原因叠加:
-          <ul>
-            <li><b>真正的失败循环</b>(15 次有效失败):算法理解多次出错,verifier 触发了 2 次 replan</li>
-            <li><b>反复 read_file</b>(12 次)+ <b>反复 write_file</b>(24 次):每次操作把文件全文塞回 prompt</li>
-            <li><b>过度确认</b>(#18-#20):测试通过后还跑了 2 次确认才停</li>
-          </ul>
-          但好消息是 <b>orchestration 完整跑通</b> —— verifier 真的把 fail 信号传给 planner,planner 真的重新出了 plan。这是 first_run 没观察到的路径。
-        </div>
-
-        <h4>💡 学到的 5 条 facts(全部 algorithm 类)</h4>
-        <ol>
-          <li><span class="pill">algorithm</span> The ludic number sieve algorithm can be implemented by iteratively removing every k-th element based on ludic numbers.</li>
-          <li><span class="pill">algorithm</span> Ludic numbers can be generated by repeatedly removing every nth number from a list starting from 2, maintaining 1.</li>
-          <li><span class="pill">algorithm</span> The ludic number sieve algorithm can be implemented by iteratively picking the first candidate, appending to results. <span class="pill orange">语义重复</span></li>
-          <li><span class="pill">algorithm</span> The ludic number sieve algorithm can be implemented by iteratively removing multiples of ludic numbers. <span class="pill orange">语义重复</span></li>
-          <li><span class="pill">algorithm</span> Ludic numbers can be generated using a sieve algorithm starting from natural numbers. <span class="pill orange">语义重复</span></li>
-        </ol>
-        <div class="note-box">
-          5 条都是同一句话的不同措辞——fact 去重 normalize 没拦住。但严格说这些 fact <b>没有进入 global pool</b>(global file 第一条 fact 是 0605 的)——只在自己 case 的 long_term_memory.json 里。
-        </div>
-
-      </div>
-    </div>
-
-
-    <!-- ============ Case B: mbpp_0605 (fact-spam 灾区) ============ -->
-    <div class="step">
-      <div class="step-header">
-        <div>
-          <p class="title">mbpp_0605 — prime_num(fact-spam 灾区,save_memory 暴走)</p>
-          <p class="summary">✅ passed · 1 plan · 52 LLM · 77.7k/3.5k tokens · 100s · pytest 12/12 全过 · <b>save_memory 12 次,产 11 条几乎一样的 fact</b></p>
-        </div>
-        <div class="toggle"></div>
-      </div>
-      <div class="step-body">
-
-        <h4>📝 Prompt</h4>
-<pre><code>Write a function to check if the given integer is a prime number.
-
-assert prime_num(13)==True
-assert prime_num(7)==True
-assert prime_num(-1010)==False</code></pre>
-
-        <h4>💻 最终 solution.py</h4>
-<pre><code>def prime_num(n: int) -&gt; bool:
-    if n &lt;= 1:
-        return False
-    if n &lt;= 3:
-        return True
-    if n % 2 == 0 or n % 3 == 0:
-        return False
-    i = 5
-    while i * i &lt;= n:
-        if n % i == 0 or n % (i + 2) == 0:
-            return False
-        i += 6
-    return True</code></pre>
-
-        <div class="note-box good">
-          <b>实现质量挺好</b>:用了 6k±1 优化,边界 n≤1 / n≤3 都处理了。题目本身简单,coder 一次写对。
-        </div>
-
-        <h4>📊 工具调用统计</h4>
-        <table>
-          <thead><tr><th>tool</th><th>次数</th><th>备注</th></tr></thead>
-          <tbody>
-            <tr><td>write_file</td><td>20</td><td><b>20 次写,但代码内容反复抖动</b>(几乎都是测试通过后又改)</td></tr>
-            <tr><td>run_command (pytest)</td><td>12</td><td><b>12 次全部 returncode=0</b> — 1 次成功后又重写、再跑、再写、再跑...</td></tr>
-            <tr><td>save_memory</td><td>12</td><td><b>主灾区</b>:11 条 fact 都是同一句话的不同措辞</td></tr>
-          </tbody>
-        </table>
-
-        <h4>📜 11 条相似 fact 的措辞对比(进了 global pool)</h4>
-<pre><code>"The project tests Python functions using pytest with the -q option and disables warnings during test runs."
-"This project uses pytest with the -q option and --disable-warnings for running tests."
-"This project uses pytest with -q and --disable-warnings options to silently run tests."
-"This project uses pytest with the -q (quiet) flag and --disable-warnings to run tests with minimal output."
-"The project uses pytest with the -q flag to run tests quietly and disables warnings to keep the output clean."
-"The project uses pytest with the -q flag to run tests quietly and disables warnings using --disable-warnings."
-"This project uses pytest with the -q flag and --disable-warnings for running tests quietly and cleanly."
-"The project uses pytest with the command 'pytest -q test_solution.py --disable-warnings' to run tests quietly and suppress warnings."
-"The project uses pytest with -q for quiet test output and includes disabling warnings during test runs."
-"Prime number checking function is implemented and tested with pytest using simple assert statements in a dedicated test file."
-"Prime number checking function implemented using 6k+-1 optimization for efficiency."</code></pre>
-
-        <div class="note-box bad">
-          <b>这是 fact 去重 normalize 完全失效的样本</b>。9 条都在讲"项目用 pytest -q --disable-warnings",但因为措辞各不同(uses vs tests,with vs using,quietly vs silently...),normalize 后的字符串各不相同 → 都被当成新 fact 存进 long-term + global。<br>
-          0605 单 case 就 <b>把 global facts pool 撑到 11 条</b>,占总 40 条的 27.5%。
-        </div>
-
-        <h4>💡 这个 case 暴露的两个问题</h4>
-        <ol>
-          <li><b>过度执行(写完测试通过后没收手)</b>:12 次 pytest 全过,但每过一次就又 write_file + save_memory + 再跑 pytest,跟 first_run 的老问题一脉相承</li>
-          <li><b>save_memory 没有"上限"</b>:coder system prompt 没说"每个 task 最多存 1-2 条 lesson",所以 LLM 想存就存</li>
-        </ol>
-
-      </div>
-    </div>
-
-
-    <!-- ============ Case C: mbpp_0604 (理论最优样) ============ -->
-    <div class="step">
-      <div class="step-header">
-        <div>
-          <p class="title">mbpp_0604 — reverse_words(本轮最干净,15 LLM 一次过)</p>
-          <p class="summary">✅ passed · 1 plan · 15 LLM · 20.5k/0.9k tokens · 26.2s · pytest 3/3 全过 · <b>没有重写抖动 / 没有过度确认</b></p>
-        </div>
-        <div class="toggle"></div>
-      </div>
-      <div class="step-body">
-
-        <h4>📝 Prompt</h4>
-<pre><code>Write a function to reverse words seperated by spaces in a given string.
-
-assert reverse_words("python program")==("program python")
-assert reverse_words("java language")==("language java")
-assert reverse_words("indian man")==("man indian")</code></pre>
-
-        <h4>💻 最终 solution.py</h4>
-<pre><code>def reverse_words(sentence: str) -&gt; str:
-    # Split sentence into words based on whitespace, reverse the list and join with a single space
-    words = sentence.split()
-    reversed_words = words[::-1]
-    return ' '.join(reversed_words)</code></pre>
-
-        <h4>📊 工具调用统计</h4>
-        <table>
-          <thead><tr><th>tool</th><th>次数</th><th>备注</th></tr></thead>
-          <tbody>
-            <tr><td>read_file</td><td>1</td><td>只读了一次 stub solution.py</td></tr>
-            <tr><td>write_file</td><td>4</td><td>solution.py + test_solution.py × 3(可接受范围)</td></tr>
-            <tr><td>run_command (pytest)</td><td>3</td><td><b>3 次都 returncode=0,且全是必要的</b>(改完都跑了一次)</td></tr>
-            <tr><td>save_memory</td><td>3</td><td>1 条实现 + 2 条 testing(0604 的 fact 也没进 global pool)</td></tr>
-          </tbody>
-        </table>
-
-        <div class="note-box good">
-          <b>这是 10 个 case 里最贴近"应该长成的样子"的 case</b>:read 一次 → write → pytest → save → done。15 次 LLM、20.5k input、26 秒走完 plan→exec→verify。后续要是能把所有 case 压到 0604 这个体量(平均 ~25k input),token 总量能砍到现在的一半以下。
-        </div>
-
-        <h4>💡 学到的 3 条 facts</h4>
-        <ol>
-          <li><span class="pill">implementation</span> The function to reverse the order of words in a string can be implemented by splitting the string, reversing the list, and joining with spaces.</li>
-          <li><span class="pill">testing</span> Test files in this project use pytest with the -q option and --disable-warnings to suppress warnings during test runs.</li>
-          <li><span class="pill">testing</span> In this project, test files are named test_solution.py and are run using pytest with the -q and --disable-warnings flags. <span class="pill orange">语义重复</span></li>
-        </ol>
-
-      </div>
-    </div>
-
-
-    <h2>所有 facts(global pool,40 条)</h2>
-    <table>
-      <thead>
-        <tr><th>category</th><th>条数</th><th>占比</th><th>典型措辞</th></tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><span class="pill">testing</span></td>
-          <td><b>32</b></td>
-          <td>80%</td>
-          <td>"This project uses pytest with -q and --disable-warnings ..." 的 N 种说法</td>
-        </tr>
-        <tr>
-          <td><span class="pill">implementation</span></td>
-          <td>5</td>
-          <td>12.5%</td>
-          <td>"6k±1 prime check"、"deg * (pi/180) for radian"、"split + [::-1] + join 反转 words" 等</td>
-        </tr>
-        <tr>
-          <td><span class="pill">algorithm</span></td>
-          <td>2</td>
-          <td>5%</td>
-          <td>"Bell triangle DP for nth Bell number"</td>
-        </tr>
-        <tr>
-          <td><span class="pill">python list handling</span></td>
-          <td>1</td>
-          <td>2.5%</td>
-          <td>"过滤掉不够长的 row 再取第 n 列,避免 IndexError"(0611)</td>
-        </tr>
-      </tbody>
-    </table>
-
-    <h3>来源分布(40 条 global facts 来自哪个 case)</h3>
-    <table>
-      <thead><tr><th>case</th><th>candidate_facts (写)</th><th>long_term_memory (本 case 持久)</th><th>global pool (合并后)</th></tr></thead>
-      <tbody>
-        <tr><td>mbpp_0602</td><td>10</td><td>10</td><td><b style="color:var(--red)">0</b> ❗</td></tr>
-        <tr><td>mbpp_0603</td><td>5</td><td>5</td><td><b style="color:var(--red)">0</b> ❗</td></tr>
-        <tr><td>mbpp_0604</td><td>3</td><td>3</td><td><b style="color:var(--red)">0</b> ❗</td></tr>
-        <tr><td>mbpp_0605</td><td>12</td><td>12</td><td>11(其中 1 条被并)</td></tr>
-        <tr><td>mbpp_0606</td><td>5</td><td>5</td><td>5</td></tr>
-        <tr><td>mbpp_0607</td><td>5</td><td>5</td><td>5</td></tr>
-        <tr><td>mbpp_0608</td><td>5</td><td>5</td><td>5</td></tr>
-        <tr><td>mbpp_0610</td><td>4</td><td>4</td><td>4</td></tr>
-        <tr><td>mbpp_0611</td><td>5</td><td>5</td><td>5</td></tr>
-        <tr><td>mbpp_0612</td><td>5</td><td>5</td><td>5</td></tr>
-      </tbody>
-    </table>
-
-    <div class="note-box bad">
-      <b>明显的 bug:0602 / 0603 / 0604 的 18 条 fact 没进 global pool</b>。这三个 case 各自的 long_term_memory.json 里有 10/5/3 条,但 mbpp_global_facts.json 里 <b>第一条 fact 的 created_at 是 2026-04-28T21:06:03</b>(0605 完成时间),之前的全丢了。可能原因:实验脚本启动时把 global pool 文件清掉了,或者前 3 个 case 跑 end_task 时 global 文件路径被覆盖。需要在 memory.py 里查 promote_to_long_term + global pool 写入逻辑。
-    </div>
-
-    <div class="note-box warn">
-      <b>fact 去重 normalize 仍然失效</b>:40 条里 32 条都在讲"项目用 pytest -q --disable-warnings",细看大概有 <b>20+ 条都是同一句话的不同措辞</b>(uses/tests/runs、with/using、quietly/silently...)。最严重的是 0605 一个 case 就贡献了 11 条几乎一样的 testing fact。
-      <br><br>
-      <b>每个 reinforce_count 都是 0、confidence 全 = 0.0</b>:跨 case reinforce 完全没发生,因为字面字符串都不一样,匹配不上。
-      <br><br>
-      <b>对 planner 实际有用的</b>:扣掉重复后大概 5-6 条独立信息(pytest 用法 1 条 + 各题型的实现笔记 4-5 条)。其余 30+ 条是噪音。
-    </div>
-
-
-    <hr style="border: none; border-top: 1px dashed var(--border); margin: 32px 0;">
-
-
-    <h2>核心观察(分析)</h2>
-
-    <div class="note-box good">
-      <b>✓ 上一轮预言的修复都 work 了:</b>
-      <ul>
-        <li><b>planner LLM 调用现在被记录</b>(13 次,跟实际 plan 数对齐:0602×2 + 0603×3 + 其余×1)。<code>engine.build_llm_nodes</code> 给 planner LLMNode 传 memory= 的修改生效</li>
-        <li><b>verify→replan 路径首次实测触发</b>:0603 三次 plan 中,#2 / #3 都是 verifier 报 fail 后 planner 重出。0602 类似(2 次 plan)。这条路在 first_run 没经过</li>
-        <li><b>orchestration 在压力下不崩</b>:0603 烧 80 LLM、21 次 pytest(16 次失败,包括 SyntaxError / IndentationError),最终还是收敛到 rc=0 并 end_task</li>
-      </ul>
-    </div>
-
-    <div class="note-box warn">
-      <b>主要问题:过度执行 + 0603 的灾难场,共同把 token 翻倍</b>。
-      <ul>
-        <li>0605 是典型过度执行:测试 12 次全过,但每次都 write_file → save_memory → 再跑,刹不住</li>
-        <li>0603 是典型 plan 跑偏:LLM 不熟 ludic 数,反复试错;verifier 把它捞回来了,但代价是 180k token</li>
-        <li>10 case 总 input token 568k,中位数 33k,但平均 56.8k 被 0603 和 0605 拉高</li>
-      </ul>
-    </div>
-
-    <div class="note-box bad">
-      <b>新发现的 bug:前 3 个 case 的 fact 没进 global pool</b>。
-      0602 / 0603 / 0604 各自的 long_term_memory.json 里都有 fact(10 / 5 / 3 条),
-      但 mbpp_global_facts.json 第一条的 created_at 是 0605 完成时间,前面 18 条全丢。
-      需要在 <code>memory.py</code> 里查 promote_to_long_term + global pool 写入逻辑——
-      可能是 runner 启动时把 global file 当 working file 清空了,或者前 3 个 case 的 end_task 没跑到 global 写入分支。
-    </div>
-
-    <div class="note-box bad">
-      <b>fact 去重 normalize 完全失效</b>。40 条 fact 中 32 条 testing,大量是"this project uses pytest -q --disable-warnings"的不同措辞——0605 一个 case 就刷了 11 条几乎一样的。所有 reinforce_count=0,confidence=0.0,<b>跨 case 共识从未形成过</b>。
-    </div>
-
-
-    <h2>下一轮该改什么</h2>
-    <table>
-      <thead><tr><th>问题</th><th>证据</th><th>修法</th></tr></thead>
-      <tbody>
-        <tr>
-          <td><b>过度执行</b>(pytest 通过后仍继续跑)</td>
-          <td>0605 跑 12 次 pytest 全过 / 0602 跑 18 次(后 6 次纯重复)/ 0603 通过后还跑 2 次确认</td>
-          <td>coder system prompt 加:"如果 run_command 跑 pytest 返回 returncode=0,立即调 save_memory(≤1 条) 一次后停止,不要再调任何 tool"</td>
-        </tr>
-        <tr>
-          <td><b>save_memory 没节流</b></td>
-          <td>10 case 共 59 次 save_memory;0605 单 case 12 次,产 11 条几乎一样的 fact</td>
-          <td>coder system prompt 加硬性:"AT MOST 1 generalizable lesson per task";或者直接在 tool 层 cap(每个 task_id 最多 N 次 save_memory)</td>
-        </tr>
-        <tr>
-          <td><b>fact 去重失效</b>,字面不同就当新 fact</td>
-          <td>40 条 facts,32 条 testing,reinforce_count 全 = 0</td>
-          <td>memory.py 的 normalize 改成:小写 + 去停用词 + 抽 keyword set,而不是只 strip 标点。或者用 embedding 相似度阈值</td>
-        </tr>
-        <tr>
-          <td><b>反复 read / write 同一文件</b></td>
-          <td>0603 read_file 12 次,write_file 24 次;0605 write_file 20 次</td>
-          <td>coder system prompt 加 working memory snapshot 提示:"observations 已经包含某文件,不要再 read_file";write_file 后做 hash 比较,内容没变就跳过</td>
-        </tr>
-        <tr>
-          <td><b>replace_in_file 仍然时有失败</b></td>
-          <td>0603 replace 10 次,部分失败;0602/0604 也踩过</td>
-          <td>沿用上一轮的方向 — tool 描述强调 "old_text 必须 verbatim 匹配,含空白和换行"</td>
-        </tr>
-        <tr>
-          <td><b>0602 / 0603 / 0604 的 fact 没进 global pool</b></td>
-          <td>三个 case 的 long_term_memory.json 共 18 条 fact,global_facts.json 里 0 条</td>
-          <td>查 memory.py 的 global pool 写入路径——可能 runner 启动时 truncate 了 global file,或前 3 个 case end_task 没走到 promote 的 branch</td>
-        </tr>
-        <tr>
-          <td><b>0603 算法理解错(lucky vs ludic)</b></td>
-          <td>plan #2 注意到了"prompt 跟 ludic 定义不一样",但最终交的还是 lucky number sieve</td>
-          <td>不是架构问题,是模型问题。MBPP 的 ground truth 本身用的就是 lucky number 测试,所以"过题就行"是合理策略</td>
-        </tr>
-        <tr>
-          <td><b>verifier 仍然只是判决器,不调 LLM</b></td>
-          <td>338 次 LLM 调用,verifier 0 次</td>
-          <td>设计如此(verifier 只读 TestRunResult 字段);若想让 verifier 提取 fail 模式,得先在 verifier 里加 LLMNode</td>
-        </tr>
-      </tbody>
-    </table>
-
-    <div class="note-box good">
-      <b>但仍然 ✓ 该 work 的都 work 了:</b>
-      <ul>
-        <li>plan→exec→verify→(replan)主循环在压力场景下也跑通,10 / 10 case 最终 returncode=0</li>
-        <li>verify 失败 → planner replan 的反向链路实测触发(0602 / 0603)</li>
-        <li>verifier(test_runner → env.run_command → subprocess pytest)调用链 85 次零 crash</li>
-        <li>三文件 memory 落盘正常(working_memory.json + long_term_memory.json + global_facts.json 都有数据,虽然 global 有上面提到的 bug)</li>
-        <li>tool dispatch / event_log 完整记录 LLM + tool_call + tool_result,planner / coder 双 role 区分</li>
-      </ul>
-      <b>核心问题仍然在 coder 行为侧 + memory 持久化的一处 bug</b>。先改 coder prompt + 修 global pool 写入,再跑一轮;预期 token 消耗砍一半,fact 数量降到 ~10 条以内。
-    </div>
-
-  </div>
 
 </div>
 

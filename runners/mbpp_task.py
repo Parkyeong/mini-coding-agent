@@ -36,17 +36,21 @@ import glob
 import json
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
 # Allow `python runners/mbpp_task.py ...` from any cwd.
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from config import WORKSHOP, ENABLE_METRICS, COMMAND_TIMEOUT, MODEL
+from config import (
+    WORKSHOP, ENABLE_METRICS, COMMAND_TIMEOUT, MODEL,
+    ENABLE_LLM_DEDUP, DEDUP_MODEL, MAX_MEMORY_FACTS,
+)
 from engine import run_task, build_llm_nodes
 from environment import Environment
-from memory import MemoryManager, merge_facts_into_global
+from llm_node import LLMNode
+from memory import MemoryManager, add_facts_to_pool, cap_pool
 from metrics import MetricsTracker
 
 
@@ -155,17 +159,23 @@ def cmd_setup(args) -> None:
 # run: drive the agent across materialized instances
 # ---------------------------------------------------------------------------
 
-def run_one(workspace: str) -> dict:
+def run_one(workspace: str, seed_facts: list = None) -> dict:
     """Run the agent on one materialized case. Self-contained: no shared state
     with other cases (single-file memory mode), so this is safe to call from
     parallel workers. The runner merges per-case facts into the experiment-wide
-    global pool after all cases finish."""
+    global pool periodically as workers finish.
+
+    `seed_facts` is the read-only snapshot of the global pool at the moment this
+    case started. Planner sees these as prior project knowledge alongside this
+    case's own learnings.
+    """
     instance_name = os.path.basename(workspace)
 
     memory = MemoryManager(
         long_term_file=os.path.join(workspace, "long_term_memory.json"),
         working_memory_file=os.path.join(workspace, "working_memory.json"),
         global_facts_file=None,  # parallel-safe: each case writes only to its own files
+        seed_facts=seed_facts,   # cross-case context (read-only)
     )
     metrics = MetricsTracker() if ENABLE_METRICS else None
     # test_solution.py is the official MBPP grading file. Lock it so the agent
@@ -177,19 +187,24 @@ def run_one(workspace: str) -> dict:
         protected_files=["test_solution.py"],
     )
 
-    planner, coder = build_llm_nodes(env, memory, metrics)
+    planner, coder, summarizer = build_llm_nodes(env, memory, metrics)
 
     with open(os.path.join(workspace, "prompt.md"), "r", encoding="utf-8") as f:
         prompt = f.read()
 
-    result_text = run_task(prompt, planner, coder, memory, metrics)
+    result_text = run_task(prompt, planner, coder, summarizer, memory, metrics)
     last_record = memory.data["task_history"][-1] if memory.data["task_history"] else {}
+    # Pull the case's own newly-learned facts (NOT the seed) so the runner can
+    # merge them into the global pool. memory.data["facts"] is per-case
+    # (single-file mode), seed lives separately.
+    learned_facts = list(memory.data.get("facts", []))
     return {
         "instance": instance_name,
         "status": last_record.get("status", "unknown"),
         "attempts": last_record.get("attempts", 0),
         "files_changed": last_record.get("files_changed", []),
         "result_text": result_text,
+        "learned_facts": learned_facts,
     }
 
 
@@ -200,17 +215,18 @@ def _is_already_done(workspace: str) -> bool:
     return os.path.exists(os.path.join(workspace, "working_memory.json"))
 
 
-def _run_one_safely(workspace: str) -> dict:
+def _run_one_safely(workspace: str, seed_facts: list = None) -> dict:
     """Wrapper that turns exceptions into a 'crashed' result so a single bad
     case doesn't kill the whole batch."""
     instance_name = os.path.basename(workspace)
     try:
-        return run_one(workspace)
+        return run_one(workspace, seed_facts=seed_facts)
     except Exception as e:
         return {
             "instance": instance_name,
             "status": "crashed",
             "error": str(e),
+            "learned_facts": [],
         }
 
 
@@ -242,35 +258,122 @@ def cmd_run(args) -> None:
                 kept.append(ws)
         workspaces = kept
 
+    # Validate batch_size >= workers — see design note in cmd help.
+    if args.batch_size < args.workers:
+        print(f"[error] --batch-size ({args.batch_size}) must be >= "
+              f"--workers ({args.workers}). A worker that finishes BEFORE the "
+              f"buffer fills has to start the next case using the most recent "
+              f"merged snapshot; if batch_size < workers, multiple in-flight "
+              f"workers would have used a stale snapshot the buffer is "
+              f"already overwriting.")
+        sys.exit(2)
+
     started_at = datetime.datetime.now().isoformat(timespec="seconds")
     print(f"[exp={args.exp}] Running {len(workspaces)} MBPP instances "
-          f"(workers={args.workers}{', skipped=' + str(len(skipped)) if skipped else ''}) ...")
+          f"(workers={args.workers}, batch_size={args.batch_size}"
+          f"{', skipped=' + str(len(skipped)) if skipped else ''}) ...")
     print(f"  cases_dir : {paths['cases_dir']}")
     print(f"  facts_file: {paths['facts_file']}")
     print(f"  report    : {paths['report_file']}")
+
+    # Construct dedup_node once (shared across all merge calls). LLM calls go
+    # through the same gpt-4.1-mini judge each time. Safe to reuse a single
+    # LLMNode across batches — its `messages` get reset on every find_equivalent
+    # call, no leakage between rounds.
+    dedup_node = None
+    if ENABLE_LLM_DEDUP:
+        from dedup import PROMPT as DEDUP_PROMPT
+        dedup_node = LLMNode(
+            system_prompt=DEDUP_PROMPT,
+            role="dedup",
+            max_steps=1,
+            model=DEDUP_MODEL,
+        )
+
+    # Global facts pool: lives in main thread only. Workers read snapshots
+    # at submit time, never mutate it directly. Each batch_size completed
+    # cases triggers a single-threaded merge (LLM dedup + cap to 40).
+    pool: list[dict] = []
+    pending_merge: list[dict] = []  # buffer of completed-case results awaiting merge
+
+    def _flush_pending_merge() -> None:
+        """Merge all queued case facts into the global pool, then cap to
+        MAX_MEMORY_FACTS. Called when buffer reaches batch_size (and once at end
+        for any leftover). Safe to call with empty buffer (no-op)."""
+        if not pending_merge:
+            return
+        all_facts: list[dict] = []
+        for r in pending_merge:
+            all_facts.extend(r.get("learned_facts", []) or [])
+        before_pool = len(pool)
+        before_facts = len(all_facts)
+        hits = add_facts_to_pool(pool, all_facts, dedup_node) if all_facts else 0
+        evicted = cap_pool(pool, MAX_MEMORY_FACTS)
+        added = len(pool) - before_pool + evicted
+        print(
+            f"    [merge] {len(pending_merge)} case(s), {before_facts} raw facts "
+            f"-> +{added} new, {hits} deduped, {evicted} evicted "
+            f"| pool size = {len(pool)}",
+            flush=True,
+        )
+        pending_merge.clear()
 
     results: list[dict] = []
     n = len(workspaces)
     if args.workers <= 1:
         # Sequential path — preserved for debugging / single-threaded runs.
+        # Still gets seed_facts + periodic merge semantics for parity.
         for i, ws in enumerate(workspaces, 1):
             print(f"\n========== [{i}/{n}] {os.path.basename(ws)} ==========")
-            results.append(_run_one_safely(ws))
+            res = _run_one_safely(ws, seed_facts=list(pool))
+            results.append(res)
+            if res.get("status") == "passed":
+                pending_merge.append(res)
+            if len(pending_merge) >= args.batch_size:
+                _flush_pending_merge()
     else:
-        # Parallel: I/O-bound (LLM HTTP + pytest subprocess), so threads work
-        # well — Python releases the GIL during both. Each case is fully
-        # self-contained (own workspace, own MemoryManager in single-file mode),
-        # no shared mutable state between workers.
+        # Rolling window: keep `workers` cases in flight at all times. As any
+        # case completes, pull its facts into pending_merge; if buffer hits
+        # batch_size, do the merge (single-threaded in main); then immediately
+        # start the next case, snapshotting the (possibly updated) pool as seed.
+        pending_workspaces = list(workspaces)
+        in_flight: dict = {}  # future -> workspace
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            future_to_ws = {ex.submit(_run_one_safely, ws): ws for ws in workspaces}
+            # Fill initial pipeline.
+            while pending_workspaces and len(in_flight) < args.workers:
+                ws = pending_workspaces.pop(0)
+                fut = ex.submit(_run_one_safely, ws, list(pool))
+                in_flight[fut] = ws
+
             done = 0
-            for fut in as_completed(future_to_ws):
-                ws = future_to_ws[fut]
-                done += 1
-                res = fut.result()
-                results.append(res)
-                status = res.get("status", "?")
-                print(f"  [{done:>3}/{n}] {os.path.basename(ws)}: {status}")
+            while in_flight:
+                completed, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                for fut in completed:
+                    ws = in_flight.pop(fut)
+                    done += 1
+                    res = fut.result()
+                    results.append(res)
+                    status = res.get("status", "?")
+                    print(f"  [{done:>3}/{n}] {os.path.basename(ws)}: {status}",
+                          flush=True)
+
+                    # Failed/crashed cases: drop their facts entirely (per project rule).
+                    if status == "passed":
+                        pending_merge.append(res)
+
+                    # Batch boundary: merge accumulated facts into pool.
+                    if len(pending_merge) >= args.batch_size:
+                        _flush_pending_merge()
+
+                    # Refill the worker with the next pending case (using the
+                    # current pool as seed — captures any merge that just happened).
+                    if pending_workspaces:
+                        next_ws = pending_workspaces.pop(0)
+                        new_fut = ex.submit(_run_one_safely, next_ws, list(pool))
+                        in_flight[new_fut] = next_ws
+
+    # Tail merge: any leftover passed cases that didn't fill a final batch.
+    _flush_pending_merge()
 
     finished_at = datetime.datetime.now().isoformat(timespec="seconds")
     total = len(results)
@@ -320,17 +423,19 @@ def cmd_run(args) -> None:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"\nReport saved to {paths['report_file']}")
 
-    # Merge per-case facts (long_term_memory.json under each case dir) into the
-    # experiment-wide global pool. Done after the run is fully serialized so
-    # parallel workers never contend on the global file. Also covers --skip-existing
-    # resumes by re-merging from disk every time.
-    all_case_dirs = sorted(glob.glob(os.path.join(paths["cases_dir"], "mbpp_*")))
-    local_files = [os.path.join(d, "long_term_memory.json") for d in all_case_dirs]
-    merge_info = merge_facts_into_global(local_files, paths["facts_file"])
-    print(f"Merged facts: {merge_info['stats']['raw']} raw -> "
-          f"{merge_info['stats']['merged']} unique "
-          f"(from {merge_info['stats']['sources']} sources) "
-          f"-> {paths['facts_file']}")
+    # Save the in-memory global pool to disk. The pool was built incrementally
+    # during the run via per-batch merges (see _flush_pending_merge above), so
+    # there's no separate "merge after run" pass — just serialize the final
+    # state. The standalone `runners.merge_facts` CLI is still available for
+    # post-hoc re-merging from per-case long_term_memory.json files.
+    payload = {
+        "facts": pool,
+        "updated_at": datetime.datetime.now().isoformat(timespec='seconds'),
+    }
+    os.makedirs(os.path.dirname(paths["facts_file"]), exist_ok=True)
+    with open(paths["facts_file"], "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"Final global facts pool: {len(pool)} unique facts -> {paths['facts_file']}")
 
     # Render dataset.html alongside the report. Failure here is non-fatal — the
     # JSON outputs are the source of truth; rendering can always be retried via
@@ -373,6 +478,11 @@ def _add_run_args(p):
     p.add_argument("--workers", type=int, default=4,
                    help="number of parallel agent workers (default: 4; "
                         "set to 1 for sequential / debugging)")
+    p.add_argument("--batch-size", type=int, default=4,
+                   help="merge facts into the global pool every N completed "
+                        "cases (default: 4). Must be >= --workers. Smaller = "
+                        "finer cross-case knowledge sharing; larger = fewer "
+                        "merge calls.")
     p.add_argument("--skip-existing", action="store_true",
                    help="skip cases whose working_memory.json already exists "
                         "(use to resume after a crash)")

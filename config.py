@@ -60,6 +60,22 @@ FACT_REINFORCE_DELTA = 0.2
 FACT_MAX_CONFIDENCE = 1.0
 FACT_GRACE_PERIOD_TASKS = 5
 
+# LLM-based semantic dedup for global facts pool (used at merge time).
+# String-normalize-only dedup misses near-duplicates with different wording
+# ("uses pytest -q" vs "tests run quietly via pytest -q"), which dominate the
+# fact pool in practice. We add a tiny LLM judge to catch those before they
+# pile up. Cheaper model than the main agent — judgment is binary, not creative.
+ENABLE_LLM_DEDUP = True
+DEDUP_MODEL = "openai/gpt-4.1-mini"
+
+# Summarizer role: after a passed case, distills 1-2 project-level lessons
+# from the full task trace (plan + tool actions + verifier results + final
+# code). Replaces coder's save_memory tool — facts now come from a whole-
+# system review, not from coder's mid-execution side-thoughts. Same model as
+# the main agent (gpt-4o-mini) so summary quality matches the tasks the agent
+# actually solves; cost is tiny (~$0.10 per 257 cases).
+SUMMARIZER_MODEL = "openai/gpt-4o-mini"
+
 # Note: global facts files are NOT a config constant anymore — each experiment
 # owns its own facts file under Execution/<exp_name>/mbpp_global_facts.json,
 # and the runner passes that path to MemoryManager(global_facts_file=...).
