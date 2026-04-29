@@ -50,7 +50,12 @@ save_memory guidance:
 
 Other rules:
 - Prefer minimal change. If a local replacement is enough, do not rewrite the whole file.
-- In your final response: briefly summarize what you changed and the test result."""
+- In your final response: briefly summarize what you changed and the test result.
+
+Read-only files (DO NOT modify):
+- `test_solution.py` is the benchmark's official grading file. It is locked.
+  Any write_file / replace_in_file targeting it will be refused — do not try.
+  If a test fails, the fix is always in `solution.py`, never in the test file."""
 
 
 def build_input(step: str, memory) -> str:

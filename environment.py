@@ -20,9 +20,15 @@ class Environment:
     # Subclasses (e.g. DockerEnvironment) override this to identify themselves.
     backend_name = "subprocess"
 
-    def __init__(self, workspace: str, command_timeout: int = 20):
+    def __init__(self, workspace: str, command_timeout: int = 20,
+                 protected_files: Optional[list[str]] = None):
         self.workspace = os.path.abspath(workspace)
         self.command_timeout = command_timeout
+        # Files (matched by basename) that are read-only for the agent. Used
+        # by benchmark runners to lock the official grading test file so the
+        # agent cannot tamper with it during the run. Tool-level only; a
+        # determined agent could still bypass via run_command shell tricks.
+        self.protected_files: set[str] = set(protected_files or [])
 
     def safe_path(self, path: str) -> str:
         if os.path.isabs(path):
@@ -47,6 +53,11 @@ class Environment:
 
     def write_file(self, file_path: str, content: str) -> None:
         path = self.safe_path(file_path)
+        if os.path.basename(path) in self.protected_files:
+            raise PermissionError(
+                f"'{os.path.basename(path)}' is read-only (benchmark grading file). "
+                f"Modify solution.py instead."
+            )
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)

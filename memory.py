@@ -407,3 +407,75 @@ class MemoryManager:
         if project:
             return f"{project}_{count + 1:04d}"
         return f"{count + 1:04d}"
+
+
+# ---------------------------------------------------------------------------
+# Cross-case merge — used by parallel runners
+# ---------------------------------------------------------------------------
+
+def merge_facts_into_global(local_fact_files: list[str], global_facts_file: str) -> dict:
+    """Aggregate per-case facts into a single global pool.
+
+    Used after a parallel run, where each case wrote its facts into its own
+    long_term_memory.json (in single-file mode) instead of contending for a
+    shared global file. This function reproduces the same dedup-and-reinforce
+    semantics that _promote_fact would have applied if cases ran sequentially.
+
+    Args:
+      local_fact_files: paths to each case's long_term_memory.json
+      global_facts_file: target path for the merged pool
+
+    Returns:
+      {"facts": [...], "stats": {"sources": N, "raw": M, "merged": K}}
+    """
+    pool: list[dict] = []
+    by_norm: dict[str, dict] = {}
+    raw_count = 0
+    sources = 0
+
+    for path in local_fact_files:
+        if not os.path.exists(path):
+            continue
+        sources += 1
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        for fact in data.get("facts", []) or []:
+            raw_count += 1
+            norm = _normalize_fact(fact.get("fact", ""))
+            if not norm:
+                continue
+            existing = by_norm.get(norm)
+            if existing is None:
+                # Copy so we don't mutate the source case's record.
+                merged = dict(fact)
+                merged.setdefault("reinforced_by", [merged.get("source_task_id", "?")])
+                merged["reinforce_count"] = 0
+                merged["confidence"] = FACT_INITIAL_CONFIDENCE
+                by_norm[norm] = merged
+                pool.append(merged)
+            else:
+                existing["reinforce_count"] = existing.get("reinforce_count", 0) + 1
+                existing["confidence"] = min(
+                    existing.get("confidence", 0) + FACT_REINFORCE_DELTA,
+                    FACT_MAX_CONFIDENCE,
+                )
+                src = fact.get("source_task_id")
+                if src and src not in existing.setdefault("reinforced_by", []):
+                    existing["reinforced_by"].append(src)
+                existing["last_reinforced_at"] = datetime.now().isoformat(timespec='seconds')
+
+    payload = {
+        "facts": pool,
+        "updated_at": datetime.now().isoformat(timespec='seconds'),
+    }
+    os.makedirs(os.path.dirname(global_facts_file), exist_ok=True)
+    with open(global_facts_file, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    return {
+        "facts": pool,
+        "stats": {"sources": sources, "raw": raw_count, "merged": len(pool)},
+    }

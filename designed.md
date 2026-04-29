@@ -390,19 +390,23 @@ def _normalize_fact(fact: str) -> str:
 - `working_memory_file`（可选）：per-instance working memory dump —— 任务结束时把 WM 完整状态落盘
 - `global_facts_file`（可选）：跨 instance 共享 facts pool
 
-runner 在 `run_one()` 里给三个文件路径都拼好：
+并发跑 case 时多个 worker 同时往 `mbpp_global_facts.json` 写会触发 race condition（互相覆盖丢数据）。所以 runner 现在采用 **case-local + post-run merge** 模式：
 
 ```python
+# run_one() — 跑的过程中,每个 case 是 single-file mode
 memory = MemoryManager(
     long_term_file=os.path.join(workspace, "long_term_memory.json"),
     working_memory_file=os.path.join(workspace, "working_memory.json"),
-    global_facts_file=facts_file,    # Execution/<exp>/mbpp_global_facts.json
+    global_facts_file=None,    # 关键:不写共享文件,纯 per-case
 )
 ```
 
-**facts 的双向写入**（dual-file mode）：
-- 每个 case 学到的 facts → 同时写 per-case 的 `long_term_memory.json`（按 source_task_id 过滤本 case 自己的）和 `mbpp_global_facts.json`（跨 case 累积）
-- planner 启动时拿到的 facts = global file 的全部（让 reinforce 真的能跨 case 发生）
+**facts 的两阶段写入：**
+
+1. **跑期(并发安全)**：每个 case 学到的 facts 全部写在自己的 `long_term_memory.json` 里，**完全不碰 `mbpp_global_facts.json`**。worker 之间无共享文件 → 0 锁竞争
+2. **跑完后(主线程，单线程)**：runner 调 `memory.merge_facts_into_global()` 扫描所有 case 的 `long_term_memory.json`，按 `_normalize_fact()` 文本归一化去重，匹配上的累加 `reinforce_count` / `confidence` / 合并 `reinforced_by`，最后写一次 `mbpp_global_facts.json`
+
+**取舍：** 跑期间 case 之间互相看不到对方的 fact —— 即使顺序跑也是这样（之前的 dual-file mode 里跨 case reinforce 在实测数据里 reinforce_count 始终 0，本来就基本不发生）。换来的是并发安全 + 跑期更轻 IO。
 
 每个实验目录独立 → 不同实验的 facts 互不污染，方便做 "with memory vs without memory" 对照实验。
 
@@ -433,8 +437,23 @@ Execution/
 | 命令 | 干什么 |
 |---|---|
 | `setup --exp NAME [--subset sanitized\|full] [--split test\|train\|...] [--limit N]` | 从 HuggingFace 下载 MBPP，物化 N 个 case 到 `single_case_details/` |
-| `run --exp NAME [--limit N]` | 跑 agent 过所有 (或前 N 个) 物化的 case，写报告 |
-| `all --exp NAME ...` | 上面两个连起来 |
+| `run --exp NAME [--limit N] [--workers N] [--skip-existing]` | 跑 agent 过所有 (或前 N 个) 物化的 case，写报告 |
+| `all --exp NAME ...` | 上面两个连起来（继承 run 的所有参数） |
+
+**`--workers N`**（默认 4）：并发 worker 数。`run_one()` I/O bound（HTTP + subprocess），用 `ThreadPoolExecutor` 启 N 条线程并行。
+- `1` = 顺序跑（debug 用）
+- `4` = 默认（~3-3.5x 加速，257 题约 2.5 小时）
+- `8` = 激进（~5x 加速，约 1.5 小时；要看 OpenRouter rate limit 余量）
+
+**`--skip-existing`**：跳过已经有 `working_memory.json` 的 case。用于断点续跑 —— 长跑挂了就这样恢复：
+
+```bash
+# 第一次跑挂在第 187 题
+python -m runners.mbpp_task all --exp baseline --split test --limit 0 --workers 4
+
+# 重跑,跳过 1-187,从 188 开始
+python -m runners.mbpp_task run --exp baseline --skip-existing --workers 4
+```
 
 ### 5.2 报告格式
 
@@ -445,6 +464,8 @@ Execution/
   "model": "openai/gpt-4o-mini",
   "started_at": "2026-04-27T...",
   "finished_at": "2026-04-27T...",
+  "workers": 4,
+  "skipped_existing": [],
   "totals": {"total": 10, "passed": 7, "failed": 2, "crashed": 1, "other": 0},
   "results": [
     {"instance": "mbpp_0011", "status": "passed", "attempts": 3,
@@ -454,10 +475,14 @@ Execution/
 }
 ```
 
+`results` 数组在写盘前按 `instance` 名字排序，所以并发完成顺序不影响输出 → 报告 deterministic，方便不同实验之间 diff。
+
 ### 5.3 终端输出（极简化后）
 
+**顺序模式（`--workers 1`）**：每个 case 一个块，看得到细节：
+
 ```
-========== mbpp_0011 ==========
+========== [3/10] mbpp_0011 ==========
 Plan: 4 steps
   step 1/4: PASS
   step 2/4: PASS
@@ -468,7 +493,31 @@ PASSED (5 attempts, 0 replans)
 metrics: 8 calls, 2340/680 in/out tokens, 5.1s
 ```
 
+**并发模式（`--workers >= 2`）**：多 case 交错，每个 case 完成时打一行结果：
+
+```
+[exp=baseline] Running 257 MBPP instances (workers=4) ...
+  [  1/257] mbpp_0017: passed
+  [  2/257] mbpp_0011: passed
+  [  3/257] mbpp_0019: passed
+  [  4/257] mbpp_0014: failed
+  ...
+```
+
+并发模式下 plan / step 细节不打印（多 case 交错会乱），细节都在 `working_memory.json` 的 event_log 里。
+
 不再打印 plan 全文 / tool 调用 / coder LLM 中间步骤——这些都在 event_log 里，要查直接看 `memory.json`。
+
+### 5.4 辅助工具
+
+跟主 runner 同目录下还有两个独立 CLI 工具，**只读不写主流程产物**，跑完实验再用：
+
+| 工具 | 用途 |
+|---|---|
+| `runners.render_experiment` | 把一个实验的所有 JSON 结果渲染成 `dataset.html`，自包含可独立打开。runner 跑完会自动调一次；改了模板想重渲染就手动跑 `python -m runners.render_experiment --exp NAME` |
+| `runners.audit_tests` | 检查每个 case 的 `test_solution.py` 跟 setup 写入的 canonical 版本是否一致，统计有多少被 agent 改过、有多少官方 assert 仍在原位。**lock 上线后正常应该 100% untouched**，跑一次确认 lock 在工作 |
+
+两者都不依赖 LLM API，纯本地静态分析，秒级出结果。
 
 ---
 
@@ -556,6 +605,31 @@ python -m runners.mbpp_task run --exp exp_a_new_prompt
 
 或者反复跑 setup 同步新 split / 新 subset，run 不变。
 
+### 6.7 为什么把 `test_solution.py` 设成 read-only
+
+MBPP 的官方 test_list 在 setup 时被写进 `test_solution.py`，agent 拿到的 toolbox 包含 `write_file` / `replace_in_file`，**理论上能改这个文件**。早期实测发现：约 11% 的 case，agent 在 debug 过程中把 test 改成"自己 solution 能过的"版本（"hello world" → "world hello" 这类），verifier 看到 returncode=0 直接判 pass —— 但 solution 实际跑官方 test 不一定过。这把 reported pass@1 往上拉了 ~2-3 个百分点的虚高。
+
+修法：**`Environment` 加 `protected_files` 黑名单**，写文件操作（`Environment.write_file`，所有 fs 工具的 choke point）检测 basename 命中就 raise `PermissionError`。runner 在 `run_one()` 构造 env 时传 `protected_files=["test_solution.py"]`，agent 调 `write_file('test_solution.py', ...)` / `replace_in_file('test_solution.py', ...)` 都会被拦下，工具返回 "Refused: ... do not retry — modify solution.py instead." 给 LLM。
+
+好处：
+- **单点防御**：所有 fs 工具走 `Environment.write_file` 一处，加一道 check 就全覆盖
+- **零误判**：lock 后 verifier 报的 pass@1 ≡ clean re-grade pass@1，跟 AFlow / 论文里报的 pass@1 直接可比
+- **agent 行为更干净**：coder 的 system prompt 加了一段 "test_solution.py is locked"，LLM 一开始就知道，不去白浪费 token 尝试
+
+**已知小破口**（见 L9）：`run_command` 走 shell 仍然能改文件（`echo > test_solution.py`），但 4o-mini 实测里几乎不会主动这么干 —— 它只用专门的 fs 工具。
+
+### 6.8 为什么并发选 ThreadPoolExecutor 而不是 multiprocessing / asyncio
+
+`run_one()` 是经典 I/O bound：每题 ~2 分钟里，95%+ 的时间在等 OpenRouter HTTP 响应或 pytest subprocess。CPU 几乎不动。
+
+| 方案 | 适合不适合 |
+|---|---|
+| **threads** ✓ | I/O 等待时 Python 释放 GIL，多线程能真并行；每个 case 一个 MemoryManager / Environment 实例，无 GIL 内争抢 |
+| processes | I/O bound 场景下进程的隔离收益用不上，反而每进程额外开销（启动、序列化）拖慢 |
+| asyncio | 需要把 `requests` 全换成 `httpx`，`subprocess` 全换成 `asyncio.subprocess`，整个调用链都得 async-ify，性价比低 |
+
+实测 4 worker ~3-3.5x 加速、8 worker ~5x 加速，符合 I/O bound 场景的预期（不是线性扩展，因为 OpenRouter 偶尔慢响应让 worker 互相等）。
+
 ---
 
 ## 7. 已知局限
@@ -608,6 +682,20 @@ Planner / coder 取 facts 只按 confidence 排序 top-N，不做关键词或 em
 
 挪出 LLM judge 之后，verifier 完全相信 pytest returncode。**风险**：测试本身有 bug 时无法察觉（但 MBPP / SWE-bench 的测试是数据集自带，不是 agent 写的，所以这风险很小）。
 
+### L9. `protected_files` 只在工具层拦截，shell 能绕
+
+`Environment.write_file` 拦下了 `write_file` / `replace_in_file` 工具，但 `run_command` 走 shell 还是能改任何文件（比如 `echo "..." > test_solution.py` / `rm test_solution.py`）。
+
+**为什么接受**：
+- 4o-mini 实测里从不主动 shell 重定向去改文件，prompt 工程已经教会它"想改文件用 fs 工具"
+- 真要补的话，在 verifier grading 前用 prompt.md 重新生成 canonical 版 `test_solution.py` 覆盖一次（双层防御）。先放着，等观测到真的有 case 被 shell 绕过去再加
+
+### L10. 跨 case fact reinforce 在并发模式下不发生
+
+case-local + post-run merge 模式下，跑期间 case A 学到的 fact 不会进入 case B 的 planner 上下文（merge 在所有 case 跑完后才进行）。**实测影响很小**：之前 dual-file mode 的数据里，`reinforce_count` 也几乎全是 0 —— 各个 case 学到的 fact 字面措辞各异，本来 reinforce 就基本不发生。
+
+**修法待定**：如果以后想要"边跑边学"，可以让 merge 在每 N 个 case 完成后增量跑一次，并把 merged 结果广播给后续的 worker。当前 N=∞（只在结束时跑一次），对 pass@1 数字无影响。
+
 ---
 
 ## 8. 后续可扩展点（不在当前范围）
@@ -615,11 +703,13 @@ Planner / coder 取 facts 只按 confidence 排序 top-N，不做关键词或 em
 | 方向 | 在哪加 | 收益 |
 |---|---|---|
 | **Prompt caching** | `llm.py` chat 参数 | 重复 system prompt 节省巨量 token，跑 batch 是 30%+ 成本下降 |
-| **Async 批量** | runners 层 | MBPP 257 题串行很慢，改并行至少 5x |
+| ~~Async 批量~~ ✓ 已实现 | `runners/mbpp_task.py` `cmd_run` `ThreadPoolExecutor` | MBPP 257 题 4 worker ~3.5x 加速 |
 | **Docker sandbox** | `environment.py` + `test_runner.py` | SWE-bench 必需；新增 `DockerRunner` backend，env 加 docker exec 路径 |
 | **Single-loop role** | 多写一个 `system_prompt` + 一个 `build_llm_nodes` 变体 | 跟 plan→verify 多角色对比，做消融 |
 | **Runner 抽象层** | 提取 `runners/_base.py`（common run_one/cmd_run/_exp_paths） | 加 SWE-bench / HumanEval 时不需要复制 mbpp_task.py 的样板代码 |
 | **真 sandbox** | `environment.py` 加 ulimit / unshare / docker | 当前只是路径作用域，LLM 可任意 `subprocess` 跑 shell；非可信场景需要真隔离 |
+| **shell 层 file lock** | `Environment.run_command` 拦截 / verifier grade 前 restore canonical | 闭合 L9 的破口，让 `protected_files` 防御覆盖 shell 路径 |
+| **增量 merge** | `cmd_run` 每 N 个 case 完成后跑一次 `merge_facts_into_global` 并广播 | 让并发模式下也能跨 case fact reinforce（L10 修法） |
 
 
 这些都是**扩展**，不是 rewrite——当前结构已经足够干净，加任何能力都不需要动核心。

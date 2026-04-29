@@ -36,6 +36,7 @@ import glob
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Allow `python runners/mbpp_task.py ...` from any cwd.
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -45,7 +46,7 @@ if _PROJECT_ROOT not in sys.path:
 from config import WORKSHOP, ENABLE_METRICS, COMMAND_TIMEOUT, MODEL
 from engine import run_task, build_llm_nodes
 from environment import Environment
-from memory import MemoryManager
+from memory import MemoryManager, merge_facts_into_global
 from metrics import MetricsTracker
 
 
@@ -154,16 +155,27 @@ def cmd_setup(args) -> None:
 # run: drive the agent across materialized instances
 # ---------------------------------------------------------------------------
 
-def run_one(workspace: str, facts_file: str) -> dict:
+def run_one(workspace: str) -> dict:
+    """Run the agent on one materialized case. Self-contained: no shared state
+    with other cases (single-file memory mode), so this is safe to call from
+    parallel workers. The runner merges per-case facts into the experiment-wide
+    global pool after all cases finish."""
     instance_name = os.path.basename(workspace)
 
     memory = MemoryManager(
         long_term_file=os.path.join(workspace, "long_term_memory.json"),
         working_memory_file=os.path.join(workspace, "working_memory.json"),
-        global_facts_file=facts_file,
+        global_facts_file=None,  # parallel-safe: each case writes only to its own files
     )
     metrics = MetricsTracker() if ENABLE_METRICS else None
-    env = Environment(workspace, command_timeout=COMMAND_TIMEOUT)
+    # test_solution.py is the official MBPP grading file. Lock it so the agent
+    # can't tamper with it during the run — this is what makes pass@1 reported
+    # by verifier directly comparable to clean re-grade (and to AFlow et al.).
+    env = Environment(
+        workspace,
+        command_timeout=COMMAND_TIMEOUT,
+        protected_files=["test_solution.py"],
+    )
 
     planner, coder = build_llm_nodes(env, memory, metrics)
 
@@ -181,6 +193,27 @@ def run_one(workspace: str, facts_file: str) -> dict:
     }
 
 
+def _is_already_done(workspace: str) -> bool:
+    """A case is considered done if its working_memory.json exists. The agent
+    writes that file at end_task, so its presence means the case made it
+    through the orchestrator without crashing the runner."""
+    return os.path.exists(os.path.join(workspace, "working_memory.json"))
+
+
+def _run_one_safely(workspace: str) -> dict:
+    """Wrapper that turns exceptions into a 'crashed' result so a single bad
+    case doesn't kill the whole batch."""
+    instance_name = os.path.basename(workspace)
+    try:
+        return run_one(workspace)
+    except Exception as e:
+        return {
+            "instance": instance_name,
+            "status": "crashed",
+            "error": str(e),
+        }
+
+
 def cmd_run(args) -> None:
     paths = _exp_paths(args.exp)
 
@@ -192,28 +225,52 @@ def cmd_run(args) -> None:
     workspaces = sorted(glob.glob(os.path.join(paths["cases_dir"], "mbpp_*")))
     if args.limit:
         workspaces = workspaces[: args.limit]
-
     if not workspaces:
         print(f"[exp={args.exp}] No mbpp_* workspaces in {paths['cases_dir']}.")
         return
 
+    # --skip-existing: drop cases that already have working_memory.json. Lets
+    # you resume a long parallel run after a crash without re-paying for
+    # already-done cases.
+    skipped: list[str] = []
+    if args.skip_existing:
+        kept = []
+        for ws in workspaces:
+            if _is_already_done(ws):
+                skipped.append(os.path.basename(ws))
+            else:
+                kept.append(ws)
+        workspaces = kept
+
     started_at = datetime.datetime.now().isoformat(timespec="seconds")
-    print(f"[exp={args.exp}] Running {len(workspaces)} MBPP instances ...")
+    print(f"[exp={args.exp}] Running {len(workspaces)} MBPP instances "
+          f"(workers={args.workers}{', skipped=' + str(len(skipped)) if skipped else ''}) ...")
     print(f"  cases_dir : {paths['cases_dir']}")
     print(f"  facts_file: {paths['facts_file']}")
     print(f"  report    : {paths['report_file']}")
 
-    results = []
-    for ws in workspaces:
-        print(f"\n========== {os.path.basename(ws)} ==========")
-        try:
-            results.append(run_one(ws, paths["facts_file"]))
-        except Exception as e:
-            results.append({
-                "instance": os.path.basename(ws),
-                "status": "crashed",
-                "error": str(e),
-            })
+    results: list[dict] = []
+    n = len(workspaces)
+    if args.workers <= 1:
+        # Sequential path — preserved for debugging / single-threaded runs.
+        for i, ws in enumerate(workspaces, 1):
+            print(f"\n========== [{i}/{n}] {os.path.basename(ws)} ==========")
+            results.append(_run_one_safely(ws))
+    else:
+        # Parallel: I/O-bound (LLM HTTP + pytest subprocess), so threads work
+        # well — Python releases the GIL during both. Each case is fully
+        # self-contained (own workspace, own MemoryManager in single-file mode),
+        # no shared mutable state between workers.
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            future_to_ws = {ex.submit(_run_one_safely, ws): ws for ws in workspaces}
+            done = 0
+            for fut in as_completed(future_to_ws):
+                ws = future_to_ws[fut]
+                done += 1
+                res = fut.result()
+                results.append(res)
+                status = res.get("status", "?")
+                print(f"  [{done:>3}/{n}] {os.path.basename(ws)}: {status}")
 
     finished_at = datetime.datetime.now().isoformat(timespec="seconds")
     total = len(results)
@@ -222,11 +279,17 @@ def cmd_run(args) -> None:
     crashed = sum(1 for r in results if r.get("status") == "crashed")
     other = total - passed - failed - crashed
 
+    # Sort results by instance name so output is deterministic regardless of
+    # parallel completion order.
+    results.sort(key=lambda r: r.get("instance", ""))
+
     summary = {
         "experiment": args.exp,
         "model": MODEL,
         "started_at": started_at,
         "finished_at": finished_at,
+        "workers": args.workers,
+        "skipped_existing": skipped,
         "totals": {
             "total": total,
             "passed": passed,
@@ -243,6 +306,8 @@ def cmd_run(args) -> None:
     print(f"  crashed: {crashed}/{total}  (tool/system error)")
     if other:
         print(f"  other:   {other}/{total}")
+    if skipped:
+        print(f"  skipped (already had working_memory.json): {len(skipped)}")
 
     if crashed:
         print(f"\nCrashed instances:")
@@ -254,6 +319,18 @@ def cmd_run(args) -> None:
     with open(paths["report_file"], "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"\nReport saved to {paths['report_file']}")
+
+    # Merge per-case facts (long_term_memory.json under each case dir) into the
+    # experiment-wide global pool. Done after the run is fully serialized so
+    # parallel workers never contend on the global file. Also covers --skip-existing
+    # resumes by re-merging from disk every time.
+    all_case_dirs = sorted(glob.glob(os.path.join(paths["cases_dir"], "mbpp_*")))
+    local_files = [os.path.join(d, "long_term_memory.json") for d in all_case_dirs]
+    merge_info = merge_facts_into_global(local_files, paths["facts_file"])
+    print(f"Merged facts: {merge_info['stats']['raw']} raw -> "
+          f"{merge_info['stats']['merged']} unique "
+          f"(from {merge_info['stats']['sources']} sources) "
+          f"-> {paths['facts_file']}")
 
     # Render dataset.html alongside the report. Failure here is non-fatal — the
     # JSON outputs are the source of truth; rendering can always be retried via
@@ -292,6 +369,15 @@ def _add_setup_args(p):
     p.add_argument("--limit", type=int, default=10, help="0 = all")
 
 
+def _add_run_args(p):
+    p.add_argument("--workers", type=int, default=4,
+                   help="number of parallel agent workers (default: 4; "
+                        "set to 1 for sequential / debugging)")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="skip cases whose working_memory.json already exists "
+                        "(use to resume after a crash)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="MBPP runner (setup + run, experiment-scoped)"
@@ -306,11 +392,13 @@ def main() -> None:
     p_run = sub.add_parser("run", help="Run the agent over materialized instances")
     _add_exp_arg(p_run)
     p_run.add_argument("--limit", type=int, default=0, help="0 = all matched")
+    _add_run_args(p_run)
     p_run.set_defaults(func=cmd_run)
 
     p_all = sub.add_parser("all", help="setup then run")
     _add_exp_arg(p_all)
     _add_setup_args(p_all)
+    _add_run_args(p_all)
     p_all.set_defaults(func=cmd_all)
 
     args = parser.parse_args()

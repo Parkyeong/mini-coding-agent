@@ -16,6 +16,11 @@ def write_file(env, file_path: str, content: str) -> str:
     try:
         env.write_file(file_path, content)
         return f"Content written successfully to {env.safe_path(file_path)}"
+    except PermissionError as e:
+        return (
+            f"Refused: {e} This file is locked by the benchmark and cannot be "
+            f"written, replaced, or deleted. Do not retry — modify solution.py instead."
+        )
     except Exception as e:
         return f"An error occurred: {e}"
 
@@ -89,6 +94,11 @@ def replace_in_file(env, file_path: str, old_text: str, new_text: str) -> str:
     updated = content.replace(old_text, new_text)
     try:
         env.write_file(file_path, updated)
+    except PermissionError as e:
+        return (
+            f"Refused: {e} This file is locked by the benchmark and cannot be "
+            f"written, replaced, or deleted. Do not retry — modify solution.py instead."
+        )
     except Exception as e:
         return f"An error occurred: {e}"
 
