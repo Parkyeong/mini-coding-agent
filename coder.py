@@ -66,3 +66,85 @@ def build_input(step: str, memory) -> str:
 def run_coder(node, step: str, memory) -> dict:
     node.reset_message()
     return node.run(build_input(step, memory))
+
+
+# ---------------------------------------------------------------------------
+# c3_codespec variant: coder itself extracts a rule from tests before
+# implementing. Used when there's no planner (the c3 pipeline is
+# coder_v2 → verifier → summarizer). The PROMPT here is only the system
+# prompt; the input the coder sees is the original task (prompt + tests),
+# not a "step" from a plan.
+# ---------------------------------------------------------------------------
+
+PROMPT_WITH_SPEC = """
+You are a professional coding agent solving a task that includes a
+natural-language description AND a few test assertions.
+
+**Your scope is strictly limited to the workspace. You cannot access anything outside of the workspace.**
+
+The natural-language description may be ambiguous or inaccurate. The test
+assertions are the ground truth — if your reading of the description and
+the tests disagree, the tests win.
+
+Workflow:
+1. **Reverse-engineer the rule from tests (mental step, no tool call)**:
+   Look at the test assertions and reason about what input → output
+   transformation they require. Write down (in your reasoning) a 1-3
+   sentence general rule. Do not implement yet.
+2. Use tools to read files / understand context (only files you haven't
+   already read).
+3. Implement the rule in `solution.py`. Don't hardcode test inputs —
+   write a generalizable function.
+4. Run the project's tests once to check your work.
+5. As soon as tests pass, stop — do not keep iterating.
+
+Stopping discipline (CRITICAL — don't waste tokens after success):
+- The moment `run_command` running the test command (e.g. `pytest`) returns
+  `returncode=0`, the task is done. Return your final summary text.
+- Do NOT re-run the tests "to confirm". Do NOT rewrite already-correct files.
+- A separate summarizer role reviews the trace and extracts lessons later
+  — focus only on solving.
+
+Reverse-engineering hints:
+- If the prompt says "ASCII value" but tests show outputs that don't match
+  literal ASCII arithmetic, try alternative interpretations (alphabet
+  position 1-26, ord-offset, etc.) — pick the one that fits all tests.
+- If the prompt says "rotating N times" but tests imply iteration count,
+  follow the tests' implied counting.
+- Manually compute expected output for at least one test case using your
+  candidate rule before implementing.
+
+File reading discipline:
+- DO NOT call read_file just to confirm what you wrote.
+- Trust the tools; don't echo your own writes.
+
+Other rules:
+- Prefer minimal change. Use Python built-ins when they produce the right
+  output (sorted, max, min, sum, set, etc.) — function name in the assert
+  is just an identifier, not an algorithm requirement.
+- In your final response: briefly summarize what you changed and the test result.
+
+Read-only files (DO NOT modify):
+- `test_solution.py` is the benchmark's official grading file. It is locked.
+  Any write_file / replace_in_file targeting it will be refused — do not try.
+"""
+
+
+def build_input_with_spec(user_task: str, memory) -> str:
+    """For c3_codespec: feed the coder the original task (prompt + tests)
+    directly, plus working-memory snapshot if any."""
+    snapshot = ""
+    if memory is not None:
+        wm = memory.get_working()
+        if wm is not None:
+            snapshot = wm.snapshot_for_coder() or ""
+    if snapshot:
+        return f"{snapshot}\n\n## Task\n{user_task}"
+    return user_task
+
+
+def run_coder_with_spec(node, user_task: str, memory) -> dict:
+    """c3_codespec entry: coder gets the full task (no plan step), expected
+    to first reason about the rule from tests, then implement."""
+    node.reset_message()
+    return node.run(build_input_with_spec(user_task, memory))

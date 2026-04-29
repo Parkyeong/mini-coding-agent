@@ -56,3 +56,105 @@ def create_plan(node, user_task: str, memory_context: str = "",
     node.reset_message()
     result = node.run(build_input(user_task, memory_context, failure_context))
     return parse_plan(result["text"])
+
+
+# ---------------------------------------------------------------------------
+# c2_planspec variant: planner also extracts a natural-language rule from
+# the test cases before listing steps. Used by the c2_planspec experimental
+# config in engine.run_task. The rule is then passed to coder so the coder
+# implements based on the rule, not the (potentially ambiguous) prompt text.
+# ---------------------------------------------------------------------------
+
+PROMPT_WITH_SPEC = """You are a task planning expert for a coding agent.
+
+The user will give you a coding task that includes a natural-language
+description AND a few test assertions. The natural-language description
+may be ambiguous, vague, or even slightly inaccurate; the test assertions
+are the ground truth for the function's behavior.
+
+Your job has TWO parts:
+
+PART 1 — Extract a clear rule from the tests (spec extraction):
+  - Read the test assertions carefully
+  - Manually reason about what input → output transformation they imply
+  - Write a 1-3 sentence general rule that explains all test cases
+  - If the natural-language description and the tests disagree, the tests
+    win — describe what the tests actually require, not what the prose says
+  - Do NOT hardcode specific input/output pairs ("if input==X return Y");
+    write a *generalizable* rule
+  - Walk through one test case to prove your rule produces the expected
+    output
+
+PART 2 — List concrete steps for the coder:
+  - 1-3 actionable steps (most simple tasks need only 1)
+  - Reference the rule explicitly so coder knows what to implement
+  - Always include a verification step (run tests)
+
+Output format (in order, no extra prose around it):
+
+RULE: <1-3 sentences describing the function's actual behavior>
+EXAMPLES_WALK: <walk through one test using the rule>
+STEPS:
+1. ...
+2. ...
+"""
+
+
+def parse_plan_with_spec(text: str) -> tuple[str, str, list[str]]:
+    """Parse the planner_v2 output into (rule, examples_walk, steps).
+
+    Tolerant: if any section is missing the parser falls back to plausible
+    defaults so the run can still proceed.
+    """
+    rule = ""
+    walk = ""
+    steps_text = ""
+
+    # Greedy line-walk; section starts when we see RULE: / EXAMPLES_WALK: / STEPS:
+    section = None
+    buf: dict[str, list[str]] = {"RULE": [], "EXAMPLES_WALK": [], "STEPS": []}
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        upper = stripped.upper()
+        if upper.startswith("RULE:"):
+            section = "RULE"
+            rest = stripped[len("RULE:"):].strip()
+            if rest:
+                buf["RULE"].append(rest)
+            continue
+        if upper.startswith("EXAMPLES_WALK:") or upper.startswith("EXAMPLE_WALK:"):
+            section = "EXAMPLES_WALK"
+            rest = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+            if rest:
+                buf["EXAMPLES_WALK"].append(rest)
+            continue
+        if upper.startswith("STEPS:"):
+            section = "STEPS"
+            rest = stripped[len("STEPS:"):].strip()
+            if rest:
+                buf["STEPS"].append(rest)
+            continue
+        if section is not None and stripped:
+            buf[section].append(stripped)
+
+    rule = " ".join(buf["RULE"]).strip()
+    walk = " ".join(buf["EXAMPLES_WALK"]).strip()
+    steps_text = "\n".join(buf["STEPS"]).strip()
+
+    steps = parse_plan(steps_text) if steps_text else []
+    if not steps:
+        # Defensive: if STEPS section was missing, treat the whole rule as
+        # a one-step plan so the run proceeds.
+        steps = ["Implement the function in solution.py based on the rule."]
+
+    return rule, walk, steps
+
+
+def create_plan_with_spec(node, user_task: str, memory_context: str = "",
+                          failure_context: str = None
+                          ) -> tuple[str, str, list[str]]:
+    """c2_planspec entry point. Returns (rule, examples_walk, steps)."""
+    node.reset_message()
+    result = node.run(build_input(user_task, memory_context, failure_context))
+    return parse_plan_with_spec(result.get("text", ""))

@@ -77,7 +77,8 @@ def _extract_case_stats(case_dir: str) -> dict:
     failed_tools = Counter()
     in_tok = out_tok = latency = llm_cnt = 0
     pytest_runs = pytest_pass = pytest_fail = 0
-    pytest_timeline: list[dict] = []  # one entry per pytest run
+    coder_pytest = verifier_pytest = 0
+    pytest_timeline: list[dict] = []  # one entry per pytest run, with source label
     plan_event_indices: list[int] = []
     first_pass_event_idx: int | None = None
 
@@ -101,6 +102,7 @@ def _extract_case_stats(case_dir: str) -> dict:
             cmd = args.get("command", "") if isinstance(args, dict) else ""
             if name == "run_command" and "pytest" in (cmd or ""):
                 pytest_runs += 1
+                coder_pytest += 1
                 rc = None
                 if isinstance(result, str):
                     m = re.search(r"returncode:(-?\d+)", result)
@@ -123,6 +125,7 @@ def _extract_case_stats(case_dir: str) -> dict:
                 else:
                     pytest_fail += 1
                 pytest_timeline.append({
+                    "source": "coder",
                     "event_idx": i,
                     "rc": rc,
                     "err": err_kind,
@@ -130,6 +133,43 @@ def _extract_case_stats(case_dir: str) -> dict:
                 })
             if isinstance(result, dict) and result.get("ok") is False:
                 failed_tools[name] += 1
+        elif kind == "verify":
+            # Engine-driven pytest call (one per coder iteration). Logged by
+            # verifier.py — invisible to the LLM tool loop, so historically
+            # absent from the timeline. Shown here labeled [verifier] so users
+            # can tell it apart from coder's own run_command pytest calls.
+            pytest_runs += 1
+            verifier_pytest += 1
+            rc = payload.get("returncode")
+            passed_flag = bool(payload.get("passed"))
+            timed_out = bool(payload.get("timed_out"))
+            err_kind = ""
+            if timed_out:
+                err_kind = "timeout"
+            elif rc is not None and rc != 0:
+                # Try to recover error class from reason string.
+                reason = payload.get("reason", "") or ""
+                if "AssertionError" in reason:
+                    err_kind = "AssertionError"
+                elif "SyntaxError" in reason:
+                    err_kind = "SyntaxError"
+                elif "IndentationError" in reason:
+                    err_kind = "IndentationError"
+                else:
+                    err_kind = f"rc={rc}"
+            if passed_flag:
+                pytest_pass += 1
+                if first_pass_event_idx is None:
+                    first_pass_event_idx = i
+            else:
+                pytest_fail += 1
+            pytest_timeline.append({
+                "source": "verifier",
+                "event_idx": i,
+                "rc": rc,
+                "err": err_kind,
+                "cmd": payload.get("command", ""),
+            })
 
     return {
         "case_id": os.path.basename(case_dir),
@@ -148,6 +188,8 @@ def _extract_case_stats(case_dir: str) -> dict:
         "pytest_pass": pytest_pass,
         "pytest_fail": pytest_fail,
         "pytest_timeline": pytest_timeline,
+        "coder_pytest_runs": coder_pytest,
+        "verifier_pytest_runs": verifier_pytest,
         "plan_iterations": role_counter.get("planner", 0),
         "first_pass_event_idx": first_pass_event_idx,
         "candidate_facts": wm.get("candidate_facts", []),
@@ -669,8 +711,12 @@ def _render_pytest_timeline(timeline: list[dict]) -> str:
         sym = "✓" if rc == 0 else "✗"
         err = f" — {_esc(t['err'])}" if t["err"] else ""
         rc_str = f"rc={rc}" if rc is not None else "rc=?"
+        source = t.get("source", "coder")
+        # Visual labels so coder's manual pytest calls and engine-driven
+        # verifier runs are easy to tell apart.
+        label = "[verifier]" if source == "verifier" else "[coder]   "
         rows.append(
-            f'<div class="tl-row {cls}">#{i:<2} {sym} '
+            f'<div class="tl-row {cls}">#{i:<2} {label} {sym} '
             f'event={t["event_idx"]:<4} {rc_str}{err}</div>'
         )
     return "<pre>" + "\n".join(rows) + "</pre>"
@@ -744,7 +790,7 @@ def _render_case_card(c: dict, flagged_tags: set[str], status: str) -> str:
         <h4>tool calls</h4>
         {tool_table}
 
-        <h4>pytest timeline ({c['pytest_runs']} runs · {c['pytest_pass']} pass / {c['pytest_fail']} fail)</h4>
+        <h4>pytest timeline ({c['pytest_runs']} runs · {c['pytest_pass']} pass / {c['pytest_fail']} fail · coder={c.get('coder_pytest_runs', 0)}, verifier={c.get('verifier_pytest_runs', 0)})</h4>
         {_render_pytest_timeline(c['pytest_timeline'])}
 
         <h4>candidate facts written by this case ({len(c['candidate_facts'])})</h4>

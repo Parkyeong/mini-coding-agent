@@ -123,9 +123,27 @@ def materialize_instance(cases_dir: str, task_id: int, text: str,
     return workspace
 
 
+def _load_case_list(path: str) -> set[str]:
+    """Read a case_list.json (output by sample_cases.py) and return the set
+    of `mbpp_NNNN` ids it asks for."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "case_ids" in data:
+        return set(data["case_ids"])
+    if isinstance(data, list):
+        return set(data)
+    raise ValueError(f"unrecognized case-list format in {path}")
+
+
 def cmd_setup(args) -> None:
     paths = _exp_paths(args.exp)
     os.makedirs(paths["cases_dir"], exist_ok=True)
+
+    # Optional: only materialize the subset requested by --case-list.
+    case_filter: set[str] = set()
+    if getattr(args, "case_list", None):
+        case_filter = _load_case_list(args.case_list)
+        print(f"[exp={args.exp}] case-list filter: {len(case_filter)} cases")
 
     # 'sanitized' is the standard eval set: hand-verified, function names in
     # prose match the asserts. 'full' has more instances but ~30% noise where
@@ -136,14 +154,27 @@ def cmd_setup(args) -> None:
     print(f"[exp={args.exp}] Loading {dataset_name}/{args.subset} split={args.split} ...")
     ds = load_dataset(dataset_name, args.subset, split=args.split)
 
-    n = len(ds) if args.limit == 0 else min(args.limit, len(ds))
-    print(f"Materializing {n} instances under {paths['cases_dir']} ...")
-
-    # Field name diff between subsets: full uses 'text', sanitized uses 'prompt'.
     text_field = "prompt" if args.subset == "sanitized" else "text"
 
-    for i in range(n):
-        row = ds[i]
+    if case_filter:
+        # Filter to just the requested case ids; keep dataset order so plans
+        # come out in a predictable sequence.
+        rows = [
+            ds[i] for i in range(len(ds))
+            if f"mbpp_{ds[i]['task_id']:04d}" in case_filter
+        ]
+        if len(rows) < len(case_filter):
+            missing = case_filter - {f"mbpp_{r['task_id']:04d}" for r in rows}
+            print(f"  [warn] {len(missing)} requested cases not found in split: "
+                  f"{sorted(missing)[:5]}...")
+        n = len(rows)
+    else:
+        n = len(ds) if args.limit == 0 else min(args.limit, len(ds))
+        rows = [ds[i] for i in range(n)]
+
+    print(f"Materializing {n} instances under {paths['cases_dir']} ...")
+
+    for i, row in enumerate(rows):
         ws = materialize_instance(
             paths["cases_dir"],
             task_id=row["task_id"],
@@ -159,7 +190,8 @@ def cmd_setup(args) -> None:
 # run: drive the agent across materialized instances
 # ---------------------------------------------------------------------------
 
-def run_one(workspace: str, seed_facts: list = None) -> dict:
+def run_one(workspace: str, seed_facts: list = None,
+            config: str = "c0_baseline") -> dict:
     """Run the agent on one materialized case. Self-contained: no shared state
     with other cases (single-file memory mode), so this is safe to call from
     parallel workers. The runner merges per-case facts into the experiment-wide
@@ -168,35 +200,44 @@ def run_one(workspace: str, seed_facts: list = None) -> dict:
     `seed_facts` is the read-only snapshot of the global pool at the moment this
     case started. Planner sees these as prior project knowledge alongside this
     case's own learnings.
+
+    `config` selects which pipeline to use (c0_baseline / c1_judge /
+    c2_planspec / c3_codespec). build_llm_nodes only constructs the LLMNodes
+    each config needs; engine.run_task dispatches by config.
     """
     instance_name = os.path.basename(workspace)
 
     memory = MemoryManager(
         long_term_file=os.path.join(workspace, "long_term_memory.json"),
         working_memory_file=os.path.join(workspace, "working_memory.json"),
-        global_facts_file=None,  # parallel-safe: each case writes only to its own files
-        seed_facts=seed_facts,   # cross-case context (read-only)
+        global_facts_file=None,
+        seed_facts=seed_facts,
     )
     metrics = MetricsTracker() if ENABLE_METRICS else None
-    # test_solution.py is the official MBPP grading file. Lock it so the agent
-    # can't tamper with it during the run — this is what makes pass@1 reported
-    # by verifier directly comparable to clean re-grade (and to AFlow et al.).
     env = Environment(
         workspace,
         command_timeout=COMMAND_TIMEOUT,
         protected_files=["test_solution.py"],
     )
 
-    planner, coder, summarizer = build_llm_nodes(env, memory, metrics)
+    nodes = build_llm_nodes(env, memory, metrics, config=config)
 
     with open(os.path.join(workspace, "prompt.md"), "r", encoding="utf-8") as f:
         prompt = f.read()
 
-    result_text = run_task(prompt, planner, coder, summarizer, memory, metrics)
+    result_text = run_task(
+        prompt,
+        planner=nodes.get("planner"),
+        coder=nodes.get("coder"),
+        summarizer=nodes.get("summarizer"),
+        memory=memory,
+        metrics=metrics,
+        config=config,
+        judge=nodes.get("judge"),
+        planner_spec=nodes.get("planner_spec"),
+        coder_spec=nodes.get("coder_spec"),
+    )
     last_record = memory.data["task_history"][-1] if memory.data["task_history"] else {}
-    # Pull the case's own newly-learned facts (NOT the seed) so the runner can
-    # merge them into the global pool. memory.data["facts"] is per-case
-    # (single-file mode), seed lives separately.
     learned_facts = list(memory.data.get("facts", []))
     return {
         "instance": instance_name,
@@ -215,12 +256,13 @@ def _is_already_done(workspace: str) -> bool:
     return os.path.exists(os.path.join(workspace, "working_memory.json"))
 
 
-def _run_one_safely(workspace: str, seed_facts: list = None) -> dict:
+def _run_one_safely(workspace: str, seed_facts: list = None,
+                    config: str = "c0_baseline") -> dict:
     """Wrapper that turns exceptions into a 'crashed' result so a single bad
     case doesn't kill the whole batch."""
     instance_name = os.path.basename(workspace)
     try:
-        return run_one(workspace, seed_facts=seed_facts)
+        return run_one(workspace, seed_facts=seed_facts, config=config)
     except Exception as e:
         return {
             "instance": instance_name,
@@ -325,7 +367,7 @@ def cmd_run(args) -> None:
         # Still gets seed_facts + periodic merge semantics for parity.
         for i, ws in enumerate(workspaces, 1):
             print(f"\n========== [{i}/{n}] {os.path.basename(ws)} ==========")
-            res = _run_one_safely(ws, seed_facts=list(pool))
+            res = _run_one_safely(ws, seed_facts=list(pool), config=args.config)
             results.append(res)
             if res.get("status") == "passed":
                 pending_merge.append(res)
@@ -342,7 +384,7 @@ def cmd_run(args) -> None:
             # Fill initial pipeline.
             while pending_workspaces and len(in_flight) < args.workers:
                 ws = pending_workspaces.pop(0)
-                fut = ex.submit(_run_one_safely, ws, list(pool))
+                fut = ex.submit(_run_one_safely, ws, list(pool), args.config)
                 in_flight[fut] = ws
 
             done = 0
@@ -369,7 +411,9 @@ def cmd_run(args) -> None:
                     # current pool as seed — captures any merge that just happened).
                     if pending_workspaces:
                         next_ws = pending_workspaces.pop(0)
-                        new_fut = ex.submit(_run_one_safely, next_ws, list(pool))
+                        new_fut = ex.submit(
+                            _run_one_safely, next_ws, list(pool), args.config,
+                        )
                         in_flight[new_fut] = next_ws
 
     # Tail merge: any leftover passed cases that didn't fill a final batch.
@@ -472,6 +516,9 @@ def _add_setup_args(p):
     p.add_argument("--split", default="train",
                    choices=["train", "validation", "test", "prompt"])
     p.add_argument("--limit", type=int, default=10, help="0 = all")
+    p.add_argument("--case-list", default=None,
+                   help="path to a JSON case list (e.g. from sample_cases.py); "
+                        "only those case_ids will be materialized. Overrides --limit.")
 
 
 def _add_run_args(p):
@@ -480,12 +527,16 @@ def _add_run_args(p):
                         "set to 1 for sequential / debugging)")
     p.add_argument("--batch-size", type=int, default=4,
                    help="merge facts into the global pool every N completed "
-                        "cases (default: 4). Must be >= --workers. Smaller = "
-                        "finer cross-case knowledge sharing; larger = fewer "
-                        "merge calls.")
+                        "cases (default: 4). Must be >= --workers.")
     p.add_argument("--skip-existing", action="store_true",
                    help="skip cases whose working_memory.json already exists "
                         "(use to resume after a crash)")
+    p.add_argument("--config", default="c0_baseline",
+                   choices=["c0_baseline", "c1_judge", "c2_planspec", "c3_codespec"],
+                   help="which agent pipeline to use (default: c0_baseline). "
+                        "c0=current planner→coder→verifier, c1=judge dispatch, "
+                        "c2=planner with spec extraction, c3=no-planner with "
+                        "coder-side spec extraction.")
 
 
 def main() -> None:

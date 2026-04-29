@@ -66,7 +66,7 @@ FACT_GRACE_PERIOD_TASKS = 5
 # fact pool in practice. We add a tiny LLM judge to catch those before they
 # pile up. Cheaper model than the main agent — judgment is binary, not creative.
 ENABLE_LLM_DEDUP = True
-DEDUP_MODEL = "openai/gpt-4.1-mini"
+DEDUP_MODEL = "openai/gpt-4o-mini"      # was 4.1-mini, unified to 4o-mini for now
 
 # Summarizer role: after a passed case, distills 1-2 project-level lessons
 # from the full task trace (plan + tool actions + verifier results + final
@@ -75,6 +75,13 @@ DEDUP_MODEL = "openai/gpt-4.1-mini"
 # the main agent (gpt-4o-mini) so summary quality matches the tasks the agent
 # actually solves; cost is tiny (~$0.10 per 257 cases).
 SUMMARIZER_MODEL = "openai/gpt-4o-mini"
+
+# Task judge: decides whether a task needs planner-driven multi-step
+# decomposition or can be solved by coder alone. Used by the c1_judge config
+# in experimental ablations. Binary output: "simple" or "complex".
+# Same model as main agent so the judgment is consistent with what the agent
+# can actually plan/solve. Each call is ~200 tokens in / 5 tokens out.
+JUDGE_MODEL = "openai/gpt-4o-mini"
 
 # Note: global facts files are NOT a config constant anymore — each experiment
 # owns its own facts file under Execution/<exp_name>/mbpp_global_facts.json,
