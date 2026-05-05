@@ -123,27 +123,9 @@ def materialize_instance(cases_dir: str, task_id: int, text: str,
     return workspace
 
 
-def _load_case_list(path: str) -> set[str]:
-    """Read a case_list.json (output by sample_cases.py) and return the set
-    of `mbpp_NNNN` ids it asks for."""
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, dict) and "case_ids" in data:
-        return set(data["case_ids"])
-    if isinstance(data, list):
-        return set(data)
-    raise ValueError(f"unrecognized case-list format in {path}")
-
-
 def cmd_setup(args) -> None:
     paths = _exp_paths(args.exp)
     os.makedirs(paths["cases_dir"], exist_ok=True)
-
-    # Optional: only materialize the subset requested by --case-list.
-    case_filter: set[str] = set()
-    if getattr(args, "case_list", None):
-        case_filter = _load_case_list(args.case_list)
-        print(f"[exp={args.exp}] case-list filter: {len(case_filter)} cases")
 
     # 'sanitized' is the standard eval set: hand-verified, function names in
     # prose match the asserts. 'full' has more instances but ~30% noise where
@@ -156,21 +138,8 @@ def cmd_setup(args) -> None:
 
     text_field = "prompt" if args.subset == "sanitized" else "text"
 
-    if case_filter:
-        # Filter to just the requested case ids; keep dataset order so plans
-        # come out in a predictable sequence.
-        rows = [
-            ds[i] for i in range(len(ds))
-            if f"mbpp_{ds[i]['task_id']:04d}" in case_filter
-        ]
-        if len(rows) < len(case_filter):
-            missing = case_filter - {f"mbpp_{r['task_id']:04d}" for r in rows}
-            print(f"  [warn] {len(missing)} requested cases not found in split: "
-                  f"{sorted(missing)[:5]}...")
-        n = len(rows)
-    else:
-        n = len(ds) if args.limit == 0 else min(args.limit, len(ds))
-        rows = [ds[i] for i in range(n)]
+    n = len(ds) if args.limit == 0 else min(args.limit, len(ds))
+    rows = [ds[i] for i in range(n)]
 
     print(f"Materializing {n} instances under {paths['cases_dir']} ...")
 
@@ -470,8 +439,7 @@ def cmd_run(args) -> None:
     # Save the in-memory global pool to disk. The pool was built incrementally
     # during the run via per-batch merges (see _flush_pending_merge above), so
     # there's no separate "merge after run" pass — just serialize the final
-    # state. The standalone `runners.merge_facts` CLI is still available for
-    # post-hoc re-merging from per-case long_term_memory.json files.
+    # state.
     payload = {
         "facts": pool,
         "updated_at": datetime.datetime.now().isoformat(timespec='seconds'),
@@ -483,9 +451,9 @@ def cmd_run(args) -> None:
 
     # Render dataset.html alongside the report. Failure here is non-fatal — the
     # JSON outputs are the source of truth; rendering can always be retried via
-    # `python -m runners.render_experiment --exp <name>`.
+    # `python -m runners.mbpp_html --exp <name>`.
     try:
-        from runners.render_experiment import render_experiment
+        from runners.mbpp_html import render_experiment
         html_path = render_experiment(args.exp)
         print(f"HTML report saved to {html_path}")
     except Exception as e:
@@ -516,9 +484,6 @@ def _add_setup_args(p):
     p.add_argument("--split", default="train",
                    choices=["train", "validation", "test", "prompt"])
     p.add_argument("--limit", type=int, default=10, help="0 = all")
-    p.add_argument("--case-list", default=None,
-                   help="path to a JSON case list (e.g. from sample_cases.py); "
-                        "only those case_ids will be materialized. Overrides --limit.")
 
 
 def _add_run_args(p):

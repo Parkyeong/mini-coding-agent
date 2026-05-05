@@ -170,9 +170,8 @@ Tools (LLM 看到的工具,纯翻译层):
 
 Runners (CLI 入口):
   runners/mbpp_task.py        主入口(setup / run / all)
-  runners/render_experiment.py  生成 dataset.html
-  runners/audit_tests.py        检查 test_solution.py 完整性(lock 生效检验)
-  runners/merge_facts.py        独立 fact merge CLI(可对已跑完实验试 LLM dedup)
+  runners/mbpp_html.py        生成 dataset.html(被 mbpp_task run 自动调用,
+                              也可单独 `python -m runners.mbpp_html` 重渲染)
 
 Config:
   config.py         所有可调实验参数(MODEL / MAX_STEPS / MAX_REPLANS / DEDUP_MODEL /
@@ -485,11 +484,19 @@ Execution/
 
 ### 5.1 子命令
 
+`mbpp_task` 是主入口，3 个子命令通过 `python -m runners.mbpp_task <子命令>` 调用：
+
 | 命令 | 干什么 |
 |---|---|
 | `setup --exp NAME [--subset sanitized\|full] [--split test\|train\|...] [--limit N]` | 从 HuggingFace 下载 MBPP，物化 N 个 case 到 `single_case_details/` |
-| `run --exp NAME [--limit N] [--workers N] [--skip-existing]` | 跑 agent 过所有 (或前 N 个) 物化的 case，写报告 |
-| `all --exp NAME ...` | 上面两个连起来（继承 run 的所有参数） |
+| `run --exp NAME [--limit N] [--workers N] [--skip-existing] [--config c0_baseline\|c1_judge\|c2_planspec\|c3_codespec]` | 跑 agent 过所有(或前 N 个)物化的 case，写报告 + 生成 dataset.html |
+| `all --exp NAME ...` | setup + run 连起来(继承两边所有参数) |
+
+另有独立工具：
+
+| 命令 | 干什么 |
+|---|---|
+| `python -m runners.mbpp_html --exp NAME` | 单独重渲染 dataset.html(`mbpp_task run` 跑完会自动调一次，改了模板想重渲染就手动跑这个) |
 
 **`--workers N`**（默认 4）：并发 worker 数。`run_one()` I/O bound（HTTP + subprocess），用 `ThreadPoolExecutor` 启 N 条线程并行。
 - `1` = 顺序跑（debug 用）
@@ -559,16 +566,36 @@ metrics: 8 calls, 2340/680 in/out tokens, 5.1s
 
 不再打印 plan 全文 / tool 调用 / coder LLM 中间步骤——这些都在 event_log 里，要查直接看 `memory.json`。
 
-### 5.4 辅助工具
+### 5.4 常用工作流
 
-跟主 runner 同目录下还有两个独立 CLI 工具，**只读不写主流程产物**，跑完实验再用：
+下面是日常跑批量实验的命令。前提是 `OPENROUTER_API_KEY` 已经 export(没 export 会在 [llm.py](llm.py#L27) 直接报错)。
 
-| 工具 | 用途 |
-|---|---|
-| `runners.render_experiment` | 把一个实验的所有 JSON 结果渲染成 `dataset.html`，自包含可独立打开。runner 跑完会自动调一次；改了模板想重渲染就手动跑 `python -m runners.render_experiment --exp NAME` |
-| `runners.audit_tests` | 检查每个 case 的 `test_solution.py` 跟 setup 写入的 canonical 版本是否一致，统计有多少被 agent 改过、有多少官方 assert 仍在原位。**lock 上线后正常应该 100% untouched**，跑一次确认 lock 在工作 |
+```bash
+# smoke test: 下载 + 跑前 10 个 case
+python -m runners.mbpp_task all --exp smoke --limit 10
 
-两者都不依赖 LLM API，纯本地静态分析，秒级出结果。
+# 全量 sanitized(427 题)
+python -m runners.mbpp_task all --exp full_baseline --limit 0 --split test
+
+# 续跑:第一次跑挂了，跳过已完成的 case 接着跑
+python -m runners.mbpp_task run --exp full_baseline --skip-existing --workers 4
+
+# 单独重渲染 HTML(`run` 跑完会自动调一次，模板改了想刷新时再手动跑)
+python -m runners.mbpp_html --exp full_baseline
+```
+
+#### 常用 flag 速查
+
+| flag | 默认 | 作用 |
+|---|---|---|
+| `--workers` | 4 | 并行 agent 数 |
+| `--batch-size` | 4 | 每 N 个 case 完成后合并一次 facts pool(必须 ≥ workers) |
+| `--skip-existing` | off | 续跑：跳过已有 `working_memory.json` 的 case |
+| `--limit` | 10 (setup) / 0 (run) | 0 = all |
+| `--config` | `c0_baseline` | `c0_baseline` / `c1_judge` / `c2_planspec` / `c3_codespec` |
+| `--split` | `train` | MBPP split |
+
+> 做 ablation 对比实验(同一份 case 列表跑多个 config)是偶发场景，已不在主 CLI 里——单独写脚本组合 `setup` / `run` 调用即可。
 
 ---
 

@@ -6,8 +6,8 @@ notes.md) and emits Execution/<exp>/dataset.html. Self-contained: inlined CSS,
 opens directly in a browser. Independent of docs.html.
 
 Usage:
-    python -m runners.render_experiment --exp first_test
-    python -m runners.render_experiment --exp first_test --output report.html
+    python -m runners.mbpp_html --exp first_test
+    python -m runners.mbpp_html --exp first_test --output report.html
 
 Library entry point used by mbpp_task.py at the end of `run`:
     render_experiment(exp_name)
@@ -895,7 +895,7 @@ def render_html(data: dict) -> str:
   <p class="lead">
     Auto-generated from <code>Execution/{_esc(data['exp_name'])}/</code>.
     Source files: mbpp_exp_final_results.json, mbpp_global_facts.json, and per-case working_memory.json / long_term_memory.json.
-    Re-run <code>python -m runners.render_experiment --exp {_esc(data['exp_name'])}</code> to refresh.
+    Re-run <code>python -m runners.mbpp_html --exp {_esc(data['exp_name'])}</code> to refresh.
   </p>
 
   <h2>Overview</h2>
