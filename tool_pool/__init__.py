@@ -1,30 +1,31 @@
-"""LLM-facing tool layer.
+"""tool_pool — pool of callable utilities used by the agent system.
 
-Tools never write to memory. They only:
-  - read/mutate the workspace via Environment
-  - return strings to the LLM
+Two coexisting protocols, kept separate by usage convention (not by directory):
 
-Recording side effects (observations / files_changed) is the agent loop's job,
-which pushes events into WorkingMemory.event_log after each tool call.
+  LLM-facing tools (re-exported here, dispatched via execute_tool):
+    ops.py — read_file / write_file / list_dir / search_in_files /
+             replace_in_file / run_command
+    These return strings to the LLM and never write to memory; the agent loop
+    pushes events into WorkingMemory.event_log after each tool call.
 
-Exception: save_memory is itself a memory operation requested by the LLM, so
-it takes memory as a dependency and writes a candidate fact.
+  Python-facing helpers (NOT re-exported; imported directly by callers):
+    test_runner.py — test command discovery + result wrapper, used by verifier.
+                     Import as: `from tool_pool.test_runner import run_tests`.
+
+The split is intentional: LLM tools speak JSON in/string out; Python helpers
+return rich objects. Putting both in one directory means "all callable
+utilities live here", but `__init__.py` only exposes the LLM protocol so the
+LLM dispatcher never sees Python helpers.
 """
 
-from tools.fs import (
+from tool_pool.ops import (
     read_file,
     write_file,
     list_dir,
     search_in_files,
     replace_in_file,
+    run_command,
 )
-from tools.shell import run_command
-
-# tools/memory_tool.py (save_memory) is no longer wired into the agent.
-# Coder doesn't write facts mid-execution anymore — the dedicated summarizer
-# role distills 1-2 lessons at end-of-case from the full task trace. The
-# memory_tool.py file is kept around in case we ever want a "self-note"
-# tool again, but it isn't imported here.
 
 
 TOOL_DEFINITIONS = [

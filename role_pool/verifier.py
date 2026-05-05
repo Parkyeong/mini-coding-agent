@@ -13,7 +13,7 @@ ones (one per coder iteration).
 """
 
 from config import VERIFIER_RUN_TESTS
-from test_runner import run_tests
+from tool_pool.test_runner import run_tests
 
 
 def verify(memory, env) -> dict:

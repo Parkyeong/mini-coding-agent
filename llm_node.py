@@ -3,13 +3,14 @@
 One class, used for every LLM-driven role (planner / coder). It runs the
 "prompt -> LLM -> maybe tool calls -> tool results -> repeat" loop up to
 max_steps times. Role-specific behaviour (system prompt, tools, input
-building, output parsing) lives in the role module (planner.py / coder.py),
-not here. This file only knows how to iterate.
+building, output parsing) lives in the role module under role_pool/
+(role_pool/planner.py, role_pool/coder.py, ...), not here. This file only
+knows how to iterate.
 
 Naming note: this is the "node" in graph-based agent terminology (cf.
-LangGraph). The full *agent system* is engine.py + planner + coder + verifier
-+ memory + tools + environment together. An LLMNode by itself is not a
-complete agent; it's a single reasoning/action unit.
+LangGraph). The full *agent system* is engine.py + role_pool + memory +
+tool_pool + environment together. An LLMNode by itself is not a complete
+agent; it's a single reasoning/action unit.
 """
 
 import llm
@@ -34,6 +35,8 @@ class LLMNode:
         memory=None,
         metrics_tracker: MetricsTracker = None,
         model: str = None,
+        temperature: float = None,
+        max_tokens: int = None,
     ):
         self.system_prompt = system_prompt
         self.role = role
@@ -42,9 +45,11 @@ class LLMNode:
         self.env = env
         self.memory = memory
         self.metrics_tracker = metrics_tracker
-        # Optional per-node model override; None means use config.MODEL.
-        # Useful for cheaper auxiliary roles (e.g. fact-dedup judge).
+        # Optional per-node overrides; None means use config defaults / API
+        # defaults. All sourced from config.ROLE_CONFIGS by build_llm_nodes.
         self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
         self.messages = []
 
     def run(self, input_text: str) -> dict:
@@ -61,6 +66,8 @@ class LLMNode:
                 system_prompt=self.system_prompt,
                 tools=self.tools,
                 model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
             )
             total_input_tokens += response.get("input_tokens", 0)
             total_output_tokens += response.get("output_tokens", 0)
@@ -111,7 +118,7 @@ class LLMNode:
     # ------------------------------------------------------------------
 
     def _execute_tool(self, tool_name: str, tool_args: dict) -> str:
-        from tools import execute_tool
+        from tool_pool import execute_tool
         return execute_tool(tool_name, tool_args, env=self.env, memory=self.memory)
 
     def _normalize_args_for_log(self, name: str, args: dict) -> dict:

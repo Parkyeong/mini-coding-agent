@@ -1,7 +1,17 @@
-"""Filesystem tools. Pure: only depend on Environment, no memory writes."""
+"""LLM-facing tool implementations.
+
+All tools depend only on Environment (and the args from the LLM). No memory
+writes — observations / files_changed get pushed by the agent loop after the
+tool returns.
+"""
 
 import os
+import subprocess
 
+
+# ---------------------------------------------------------------------------
+# Filesystem
+# ---------------------------------------------------------------------------
 
 def read_file(env, file_path: str) -> str:
     try:
@@ -103,3 +113,23 @@ def replace_in_file(env, file_path: str, old_text: str, new_text: str) -> str:
         return f"An error occurred: {e}"
 
     return f"'{old_text}' replaced with '{new_text}' in {env.safe_path(file_path)} successfully"
+
+
+# ---------------------------------------------------------------------------
+# Shell
+# ---------------------------------------------------------------------------
+
+def run_command(env, command: str) -> str:
+    try:
+        result = env.run_command(command)
+    except subprocess.TimeoutExpired as e:
+        return f"Command timed out after {e.timeout}s"
+    except Exception as e:
+        return f"An error occurred: {e}"
+
+    parts = [f"returncode:{result['returncode']}"]
+    if result["stdout"]:
+        parts.append(f"stdout:{result['stdout']}")
+    if result["stderr"]:
+        parts.append(f"stderr:{result['stderr']}")
+    return "\n".join(parts) if parts else "Command executed successfully with no output"

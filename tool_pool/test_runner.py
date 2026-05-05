@@ -1,10 +1,15 @@
-"""
-Test runner for the verifier.
+"""Test runner for the verifier — Python helper inside tool_pool.
 
 Domain logic only — test_command discovery (memory hint -> marker -> none),
 result-shape (TestRunResult), output truncation. The actual subprocess call
 is delegated to Environment.run_command, so when we add a DockerEnvironment
 later, test_runner doesn't need to know.
+
+Lives in tool_pool/ alongside ops.py but is NOT re-exported by
+tool_pool/__init__.py — it speaks the Python protocol (rich TestRunResult
+object), not the LLM JSON-in/string-out protocol. Callers import directly:
+
+    from tool_pool.test_runner import run_tests
 """
 
 import os

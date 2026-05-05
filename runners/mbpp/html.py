@@ -3,11 +3,11 @@
 Reads everything under Execution/<exp>/ (the report, per-case working/long-term
 memory, prompt/solution/test files, the global facts pool, and an optional
 notes.md) and emits Execution/<exp>/dataset.html. Self-contained: inlined CSS,
-opens directly in a browser. Independent of docs.html.
+opens directly in a browser.
 
 Usage:
-    python -m runners.mbpp_html --exp first_test
-    python -m runners.mbpp_html --exp first_test --output report.html
+    python -m runners.mbpp.html --exp first_test
+    python -m runners.mbpp.html --exp first_test --output report.html
 
 Library entry point used by mbpp_task.py at the end of `run`:
     render_experiment(exp_name)
@@ -24,7 +24,7 @@ import sys
 from collections import Counter
 from statistics import median
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
@@ -895,7 +895,7 @@ def render_html(data: dict) -> str:
   <p class="lead">
     Auto-generated from <code>Execution/{_esc(data['exp_name'])}/</code>.
     Source files: mbpp_exp_final_results.json, mbpp_global_facts.json, and per-case working_memory.json / long_term_memory.json.
-    Re-run <code>python -m runners.mbpp_html --exp {_esc(data['exp_name'])}</code> to refresh.
+    Re-run <code>python -m runners.mbpp.html --exp {_esc(data['exp_name'])}</code> to refresh.
   </p>
 
   <h2>Overview</h2>

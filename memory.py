@@ -446,7 +446,7 @@ def add_facts_to_pool(pool: list[dict], facts: list[dict],
 
         pos = 0
         if dedup_node is not None and pool:
-            from dedup import find_equivalent
+            from role_pool.dedup import find_equivalent
             pos = find_equivalent(dedup_node, text, [f["fact"] for f in pool])
 
         if pos > 0:
@@ -502,7 +502,7 @@ def merge_facts_into_global(local_fact_files: list[str], global_facts_file: str,
     paraphrases — most real duplicates in the pool are differently worded
     versions of the same fact ("uses pytest -q" vs "tests run quietly via
     pytest -q"), which string normalize cannot match. The LLM call is cheap
-    enough (~$0.0002 per fact with gpt-4.1-mini) that prefiltering is not
+    enough (~$0.0002 per fact with gpt-4o-mini) that prefiltering is not
     worth the complexity. If `dedup_node=None`, no dedup is performed and
     every fact is added as novel.
 

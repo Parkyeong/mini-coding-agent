@@ -26,9 +26,9 @@ Subcommands
         setup then run
 
 Run from the project root:
-    python -m runners.mbpp_task setup --exp baseline --limit 10
-    python -m runners.mbpp_task run   --exp baseline
-    python -m runners.mbpp_task all   --exp baseline --limit 10
+    python -m runners.mbpp.task setup --exp baseline --limit 10
+    python -m runners.mbpp.task run   --exp baseline
+    python -m runners.mbpp.task all   --exp baseline --limit 10
 """
 import argparse
 import datetime
@@ -38,14 +38,14 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
-# Allow `python runners/mbpp_task.py ...` from any cwd.
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# Allow `python runners/mbpp/task.py ...` from any cwd.
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from config import (
     WORKSHOP, ENABLE_METRICS, COMMAND_TIMEOUT, MODEL,
-    ENABLE_LLM_DEDUP, DEDUP_MODEL, MAX_MEMORY_FACTS,
+    ENABLE_LLM_DEDUP, ROLE_CONFIGS, MAX_MEMORY_FACTS,
 )
 from engine import run_task, build_llm_nodes
 from environment import Environment
@@ -159,8 +159,7 @@ def cmd_setup(args) -> None:
 # run: drive the agent across materialized instances
 # ---------------------------------------------------------------------------
 
-def run_one(workspace: str, seed_facts: list = None,
-            config: str = "c0_baseline") -> dict:
+def run_one(workspace: str, seed_facts: list = None) -> dict:
     """Run the agent on one materialized case. Self-contained: no shared state
     with other cases (single-file memory mode), so this is safe to call from
     parallel workers. The runner merges per-case facts into the experiment-wide
@@ -169,10 +168,6 @@ def run_one(workspace: str, seed_facts: list = None,
     `seed_facts` is the read-only snapshot of the global pool at the moment this
     case started. Planner sees these as prior project knowledge alongside this
     case's own learnings.
-
-    `config` selects which pipeline to use (c0_baseline / c1_judge /
-    c2_planspec / c3_codespec). build_llm_nodes only constructs the LLMNodes
-    each config needs; engine.run_task dispatches by config.
     """
     instance_name = os.path.basename(workspace)
 
@@ -189,22 +184,18 @@ def run_one(workspace: str, seed_facts: list = None,
         protected_files=["test_solution.py"],
     )
 
-    nodes = build_llm_nodes(env, memory, metrics, config=config)
+    nodes = build_llm_nodes(env, memory, metrics)
 
     with open(os.path.join(workspace, "prompt.md"), "r", encoding="utf-8") as f:
         prompt = f.read()
 
     result_text = run_task(
         prompt,
-        planner=nodes.get("planner"),
-        coder=nodes.get("coder"),
-        summarizer=nodes.get("summarizer"),
+        planner=nodes["planner"],
+        coder=nodes["coder"],
+        summarizer=nodes["summarizer"],
         memory=memory,
         metrics=metrics,
-        config=config,
-        judge=nodes.get("judge"),
-        planner_spec=nodes.get("planner_spec"),
-        coder_spec=nodes.get("coder_spec"),
     )
     last_record = memory.data["task_history"][-1] if memory.data["task_history"] else {}
     learned_facts = list(memory.data.get("facts", []))
@@ -225,13 +216,12 @@ def _is_already_done(workspace: str) -> bool:
     return os.path.exists(os.path.join(workspace, "working_memory.json"))
 
 
-def _run_one_safely(workspace: str, seed_facts: list = None,
-                    config: str = "c0_baseline") -> dict:
+def _run_one_safely(workspace: str, seed_facts: list = None) -> dict:
     """Wrapper that turns exceptions into a 'crashed' result so a single bad
     case doesn't kill the whole batch."""
     instance_name = os.path.basename(workspace)
     try:
-        return run_one(workspace, seed_facts=seed_facts, config=config)
+        return run_one(workspace, seed_facts=seed_facts)
     except Exception as e:
         return {
             "instance": instance_name,
@@ -288,17 +278,20 @@ def cmd_run(args) -> None:
     print(f"  report    : {paths['report_file']}")
 
     # Construct dedup_node once (shared across all merge calls). LLM calls go
-    # through the same gpt-4.1-mini judge each time. Safe to reuse a single
-    # LLMNode across batches — its `messages` get reset on every find_equivalent
-    # call, no leakage between rounds.
+    # through ROLE_CONFIGS["dedup"] each time. Safe to reuse a single LLMNode
+    # across batches — its `messages` get reset on every find_equivalent call,
+    # no leakage between rounds.
     dedup_node = None
     if ENABLE_LLM_DEDUP:
-        from dedup import PROMPT as DEDUP_PROMPT
+        from role_pool.dedup import PROMPT as DEDUP_PROMPT
+        dedup_cfg = ROLE_CONFIGS["dedup"]
         dedup_node = LLMNode(
             system_prompt=DEDUP_PROMPT,
             role="dedup",
-            max_steps=1,
-            model=DEDUP_MODEL,
+            max_steps=dedup_cfg["max_steps"],
+            model=dedup_cfg["model"],
+            temperature=dedup_cfg.get("temperature"),
+            max_tokens=dedup_cfg.get("max_tokens"),
         )
 
     # Global facts pool: lives in main thread only. Workers read snapshots
@@ -336,7 +329,7 @@ def cmd_run(args) -> None:
         # Still gets seed_facts + periodic merge semantics for parity.
         for i, ws in enumerate(workspaces, 1):
             print(f"\n========== [{i}/{n}] {os.path.basename(ws)} ==========")
-            res = _run_one_safely(ws, seed_facts=list(pool), config=args.config)
+            res = _run_one_safely(ws, seed_facts=list(pool))
             results.append(res)
             if res.get("status") == "passed":
                 pending_merge.append(res)
@@ -353,7 +346,7 @@ def cmd_run(args) -> None:
             # Fill initial pipeline.
             while pending_workspaces and len(in_flight) < args.workers:
                 ws = pending_workspaces.pop(0)
-                fut = ex.submit(_run_one_safely, ws, list(pool), args.config)
+                fut = ex.submit(_run_one_safely, ws, list(pool))
                 in_flight[fut] = ws
 
             done = 0
@@ -381,7 +374,7 @@ def cmd_run(args) -> None:
                     if pending_workspaces:
                         next_ws = pending_workspaces.pop(0)
                         new_fut = ex.submit(
-                            _run_one_safely, next_ws, list(pool), args.config,
+                            _run_one_safely, next_ws, list(pool),
                         )
                         in_flight[new_fut] = next_ws
 
@@ -451,9 +444,9 @@ def cmd_run(args) -> None:
 
     # Render dataset.html alongside the report. Failure here is non-fatal — the
     # JSON outputs are the source of truth; rendering can always be retried via
-    # `python -m runners.mbpp_html --exp <name>`.
+    # `python -m runners.mbpp.html --exp <name>`.
     try:
-        from runners.mbpp_html import render_experiment
+        from runners.mbpp.html import render_experiment
         html_path = render_experiment(args.exp)
         print(f"HTML report saved to {html_path}")
     except Exception as e:
@@ -496,12 +489,6 @@ def _add_run_args(p):
     p.add_argument("--skip-existing", action="store_true",
                    help="skip cases whose working_memory.json already exists "
                         "(use to resume after a crash)")
-    p.add_argument("--config", default="c0_baseline",
-                   choices=["c0_baseline", "c1_judge", "c2_planspec", "c3_codespec"],
-                   help="which agent pipeline to use (default: c0_baseline). "
-                        "c0=current planner→coder→verifier, c1=judge dispatch, "
-                        "c2=planner with spec extraction, c3=no-planner with "
-                        "coder-side spec extraction.")
 
 
 def main() -> None:

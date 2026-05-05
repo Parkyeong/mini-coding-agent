@@ -17,11 +17,16 @@ _REQUEST_TIMEOUT_SECONDS = 120
 
 
 def chat(messages: list, system_prompt: str, tools: list,
-         model: str = None) -> dict:
+         model: str = None,
+         temperature: float = None,
+         max_tokens: int = None) -> dict:
     """One LLM round-trip. Returns text, tool_calls, tokens, latency.
 
     `model` overrides the global config.MODEL — used when a particular role
     (e.g. fact-dedup judge) wants a different/cheaper model than the main agent.
+    `temperature` / `max_tokens` are forwarded to the OpenRouter payload only
+    when not None (so the API default applies otherwise). LLMNode reads these
+    from ROLE_CONFIGS and passes them in.
     """
     if not API_KEY:
         raise RuntimeError(
@@ -33,6 +38,10 @@ def chat(messages: list, system_prompt: str, tools: list,
         "model": model or MODEL,
         "messages": _to_openai_messages(messages, system_prompt),
     }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     openai_tools = _to_openai_tools(tools) if tools else None
     if openai_tools:
         payload["tools"] = openai_tools

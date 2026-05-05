@@ -4,7 +4,7 @@ import os
 # LLM (OpenRouter)
 # ---------------------------------------------------------------------------
 # All comparison-experiment knobs live here so a single edit changes the run.
-MODEL = "openai/gpt-4o-mini"          # OpenRouter model id, e.g. "anthropic/claude-sonnet-4"
+MODEL = "openai/gpt-4o-mini"          # global default, used by llm.chat() when no per-role override
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -16,9 +16,7 @@ BASE_URL = "https://openrouter.ai/api/v1"
 # it via __file__ makes the path work regardless of cwd or where the project
 # is moved on disk.
 WORKSHOP = os.path.abspath(os.path.join(os.path.dirname(__file__), "Execution"))
-PROJECT_NAME = "mini coding agent"
-WORKSPACE = f"{WORKSHOP}/{PROJECT_NAME}"
-MAX_STEPS = 8
+MAX_STEPS = 8                          # LLMNode default; overridden per-role via ROLE_CONFIGS
 COMMAND_TIMEOUT = 20
 
 
@@ -28,18 +26,75 @@ COMMAND_TIMEOUT = 20
 MAX_REPLANS = 2
 MAX_RETRIES_PER_STEPS = 2
 
-MAX_CONTEXT_MESSAGES = 20
 MAX_MEMORY_TASKS = 40
 MAX_MEMORY_FACTS = 40
 
 ENABLE_METRICS = True
 
 
-def set_project(name: str):
-    """Override PROJECT_NAME / WORKSPACE at startup (used by main.py CLI)."""
-    global PROJECT_NAME, WORKSPACE
-    PROJECT_NAME = name
-    WORKSPACE = f"{WORKSHOP}/{PROJECT_NAME}"
+# ---------------------------------------------------------------------------
+# Per-role hyperparameters
+# ---------------------------------------------------------------------------
+# Single source of truth for the per-role knobs each role gets at runtime.
+# engine.build_llm_nodes() iterates this dict to construct LLMNodes; runners
+# read ROLE_CONFIGS["dedup"] when constructing the dedup node.
+#
+# Schema per role:
+#   model       — OpenRouter model id, or None for "no LLM" (verifier).
+#                 Set to e.g. "anthropic/claude-sonnet-4" for a stronger role.
+#   max_steps   — LLM rounds the role's loop runs. planner / summarizer /
+#                 dedup are one-shot (1). coder is multi-turn (8) because it
+#                 iterates with tools. None for non-LLM roles.
+#   uses_tools  — whether the role's LLMNode gets the full tool_pool/ops.py
+#                 toolkit. Only coder needs this today.
+#   temperature — sampling temperature (0.0 = deterministic, higher = more
+#                 random). Tuned per role: planner/coder low for stability,
+#                 summarizer mid for natural phrasing, dedup zero for
+#                 consistent binary judgment. None = use API default.
+#   max_tokens  — cap on response length. None = use API default. Override
+#                 when a role needs a hard cap (e.g. extended-thinking budget
+#                 or expensive long-form roles).
+#
+# Adding a new role: add an entry here + a module under role_pool/ + wire it
+# into the orchestrator. Brain (Track A) lives here too once added.
+# Adding a new param: add a key to every role + thread it through llm.chat.
+ROLE_CONFIGS: dict[str, dict] = {
+    "planner": {
+        "model": "openai/gpt-4o-mini",
+        "max_steps": 1,
+        "uses_tools": False,
+        "temperature": 0.2,
+        "max_tokens": None,
+    },
+    "coder": {
+        "model": "openai/gpt-4o-mini",
+        "max_steps": 8,
+        "uses_tools": True,
+        "temperature": 0.1,
+        "max_tokens": None,
+    },
+    "verifier": {
+        "model": None,                 # no LLM — pure pytest function
+        "max_steps": None,
+        "uses_tools": False,
+        "temperature": None,
+        "max_tokens": None,
+    },
+    "summarizer": {
+        "model": "openai/gpt-4o-mini",
+        "max_steps": 1,
+        "uses_tools": False,
+        "temperature": 0.4,
+        "max_tokens": None,
+    },
+    "dedup": {
+        "model": "openai/gpt-4o-mini",
+        "max_steps": 1,
+        "uses_tools": False,
+        "temperature": 0.0,
+        "max_tokens": None,
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -63,25 +118,9 @@ FACT_GRACE_PERIOD_TASKS = 5
 # LLM-based semantic dedup for global facts pool (used at merge time).
 # String-normalize-only dedup misses near-duplicates with different wording
 # ("uses pytest -q" vs "tests run quietly via pytest -q"), which dominate the
-# fact pool in practice. We add a tiny LLM judge to catch those before they
-# pile up. Cheaper model than the main agent — judgment is binary, not creative.
+# fact pool in practice. The dedup model itself is configured in
+# ROLE_CONFIGS["dedup"]["model"]; this flag is the on/off switch.
 ENABLE_LLM_DEDUP = True
-DEDUP_MODEL = "openai/gpt-4o-mini"      # was 4.1-mini, unified to 4o-mini for now
-
-# Summarizer role: after a passed case, distills 1-2 project-level lessons
-# from the full task trace (plan + tool actions + verifier results + final
-# code). Replaces coder's save_memory tool — facts now come from a whole-
-# system review, not from coder's mid-execution side-thoughts. Same model as
-# the main agent (gpt-4o-mini) so summary quality matches the tasks the agent
-# actually solves; cost is tiny (~$0.10 per 257 cases).
-SUMMARIZER_MODEL = "openai/gpt-4o-mini"
-
-# Task judge: decides whether a task needs planner-driven multi-step
-# decomposition or can be solved by coder alone. Used by the c1_judge config
-# in experimental ablations. Binary output: "simple" or "complex".
-# Same model as main agent so the judgment is consistent with what the agent
-# can actually plan/solve. Each call is ~200 tokens in / 5 tokens out.
-JUDGE_MODEL = "openai/gpt-4o-mini"
 
 # Note: global facts files are NOT a config constant anymore — each experiment
 # owns its own facts file under Execution/<exp_name>/mbpp_global_facts.json,

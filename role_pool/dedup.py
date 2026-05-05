@@ -11,8 +11,8 @@ expense is amortized over many parallel agent calls and only adds ~30-45 min
 to a 2.5h experiment.
 
 The judge is just an LLMNode configured with this PROMPT and (typically) a
-cheaper model (config.DEDUP_MODEL = gpt-4.1-mini). Used by
-memory.merge_facts_into_global when ENABLE_LLM_DEDUP is on.
+cheaper model (config.ROLE_CONFIGS["dedup"]["model"], default gpt-4o-mini).
+Used by memory.merge_facts_into_global when ENABLE_LLM_DEDUP is on.
 """
 
 import re

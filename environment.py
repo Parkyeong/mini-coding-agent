@@ -3,11 +3,11 @@ Execution environment.
 
 A stateful sandbox: each task gets one Environment that knows its workspace
 and how to perform primitive operations on it (read / write / list / shell).
-Tools delegate to this; verifier's test runner uses it too.
+tool_pool/ops.py delegates to this; tool_pool/test_runner.py uses it too.
 
 Currently only a local subprocess backend is implemented. A docker / remote
 backend can later be added by swapping the run_command / read_file / write_file
-implementations without touching tool.py or agent.py.
+implementations without touching tool_pool/ or engine.py.
 """
 
 import os
