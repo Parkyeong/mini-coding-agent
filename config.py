@@ -94,6 +94,17 @@ ROLE_CONFIGS: dict[str, dict] = {
         "temperature": 0.0,
         "max_tokens": None,
     },
+    # Story task — gpt-4o-mini is locked here per the story-task spec
+    # (the worker writing the actual prose must be 4o-mini for fairness across
+    # baseline / Track A / Track B). Temperature is moderate to allow some
+    # creative variability while staying coherent.
+    "writer": {
+        "model": "openai/gpt-4o-mini",
+        "max_steps": 1,
+        "uses_tools": False,
+        "temperature": 0.7,
+        "max_tokens": None,
+    },
 }
 
 

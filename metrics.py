@@ -32,3 +32,18 @@ class MetricsTracker:
             f"{total_input}/{total_output} in/out tokens, "
             f"{total_latency_s:.1f}s"
         )
+
+    def by_role(self) -> dict:
+        """Aggregate per-role tokens / call counts. Used by story_task runners
+        to compare per-component cost across baseline / Track A / Track B."""
+        result: dict = {}
+        for c in self.calls:
+            r = result.setdefault(
+                c.agent_role,
+                {"calls": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0.0},
+            )
+            r["calls"] += 1
+            r["input_tokens"] += c.input_tokens
+            r["output_tokens"] += c.output_tokens
+            r["latency_ms"] += c.latency
+        return result
