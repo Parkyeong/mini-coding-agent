@@ -77,7 +77,7 @@ THEMES: list[tuple[str, str]] = [
 ]
 TARGET_LEN = 241
 TASK_TYPE = "story"
-RUNS_PER_THEME = 3
+RUNS_PER_THEME = 4
 INNER_MAX_RETRIES = 4
 BRAIN_MAX_ATTEMPTS = 2
 OUTPUT_SUBDIR = os.path.join("story_241", "method_fixed")
@@ -85,12 +85,16 @@ OUTPUT_SUBDIR = os.path.join("story_241", "method_fixed")
 
 # ---------------------------------------------------------------------------
 # Writer dispatch — fresh LLMNode per call, shares the run's MetricsTracker
+# Returns (story, user_input_text, tokens_dict) so caller can record trajectory.
 # ---------------------------------------------------------------------------
 
 def run_writer_fresh(theme: str, guidance: str, feedback: str,
-                     metrics_tracker: MetricsTracker) -> str:
-    """One writer invocation. Fresh LLMNode each call: no message accumulation,
-    feedback / guidance go into the user message via writer_role.build_input."""
+                     previous_attempt: str,
+                     metrics_tracker: MetricsTracker) -> tuple[str, str, dict]:
+    """One writer invocation. Fresh LLMNode each call: no message accumulation.
+    feedback / guidance / previous_attempt go into the user message via
+    writer_role.build_input. previous_attempt is the prior story text so the
+    writer can revise it directly (precise char-level edits)."""
     cfg = ROLE_CONFIGS["writer"]
     node = LLMNode(
         system_prompt=writer_role.PROMPT,
@@ -101,9 +105,20 @@ def run_writer_fresh(theme: str, guidance: str, feedback: str,
         max_tokens=cfg["max_tokens"],
         metrics_tracker=metrics_tracker,
     )
-    return writer_role.run_writer(
-        node, theme=theme, guidance=guidance, feedback=feedback,
+    user_input = writer_role.build_input(
+        theme=theme, guidance=guidance,
+        feedback=feedback, previous_attempt=previous_attempt,
     )
+    n0 = len(metrics_tracker.calls)
+    node.reset_message()
+    response = node.run(user_input)
+    story = (response.get("text") or "").strip()
+    new_calls = metrics_tracker.calls[n0:]
+    tokens = {
+        "in": sum(c.input_tokens for c in new_calls),
+        "out": sum(c.output_tokens for c in new_calls),
+    }
+    return story, user_input, tokens
 
 
 # ---------------------------------------------------------------------------
@@ -111,12 +126,35 @@ def run_writer_fresh(theme: str, guidance: str, feedback: str,
 # ---------------------------------------------------------------------------
 
 def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> dict:
-    """One full attempt sequence for one (theme, run_idx)."""
+    """One full attempt sequence for one (theme, run_idx).
+
+    Returns a dict with:
+      - trajectory: flat list of {step, role, purpose, input, output, tokens}
+                    (HTML renders this; same schema as baseline / method_brain)
+      - rounds: structured per-brain-attempt view (high-level summary)
+      - tokens_by_role, hit, final_length, etc.
+    """
     metrics = MetricsTracker()
+    trajectory: list[dict] = []
+    step_counter = [0]   # mutable cell for closure-like increment
+
+    def append_step(role, purpose, input_, output_, tokens):
+        step_counter[0] += 1
+        trajectory.append({
+            "step": step_counter[0],
+            "role": role,
+            "purpose": purpose,
+            "input": input_,
+            "output": output_,
+            "tokens": tokens,
+        })
 
     # Brain LLMNode — same instance across both brain attempts so its
     # messages accumulate (initial plan → replan sees its own previous plan).
-    brain_cfg = ROLE_CONFIGS["brain"]
+    # Uses ROLE_CONFIGS["brain_fixed"] (gpt-4.1-mini) — cheaper model is OK
+    # because method_fixed has built-in replan retry. method_brain uses the
+    # stronger ROLE_CONFIGS["brain"] (gpt-5-mini) since it has no replan.
+    brain_cfg = ROLE_CONFIGS["brain_fixed"]
     brain = LLMNode(
         system_prompt=brain_role.build_system_prompt(TASK_TYPE),
         role="brain",
@@ -136,19 +174,30 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
         # ---- Brain call: initial or replan ----
         if brain_attempt == 1:
             user_input = brain_role.build_initial_input(theme_desc, TARGET_LEN)
+            purpose = "initial plan"
         else:
             user_input = brain_role.build_replan_input(rounds[-1], TARGET_LEN)
+            purpose = "replan"
 
         # IMPORTANT: do NOT call brain.reset_message() between attempts —
         # brain's accumulated context (its prev plan + failure trace) is
         # essential for replan quality.
+        n0 = len(metrics.calls)
         brain_response = brain.run(user_input)
         brain_output = (brain_response.get("text") or "").strip()
+        new_calls = metrics.calls[n0:]
+        brain_tokens = {
+            "in": sum(c.input_tokens for c in new_calls),
+            "out": sum(c.output_tokens for c in new_calls),
+        }
+        append_step("brain", purpose, user_input, brain_output, brain_tokens)
 
         plan = brain_role.parse_plan(brain_output)
 
         if plan is None:
-            # Plan unparseable: terminate this run with the failure recorded.
+            append_step("system", "PLAN_UNPARSEABLE", None,
+                        "Could not parse brain output as JSON plan",
+                        {"in": 0, "out": 0})
             rounds.append({
                 "brain_attempt": brain_attempt,
                 "brain_output": brain_output,
@@ -169,15 +218,34 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
         guidance = writer_args.get("guidance", "") or ""
 
         # ---- Inner loop: writer × INNER_MAX_RETRIES, verify each ----
+        # previous_attempt is reset to "" at the start of each brain round —
+        # brain's replan means strategic restart with new guidance, so writer
+        # shouldn't be anchored to the previous round's failed attempts.
+        # Within a round, previous_attempt accumulates the prior attempt's text.
         inner_attempts: list[dict] = []
         feedback = ""
+        previous_attempt = ""
         round_hit = False
         last_text = ""
         last_length = 0
 
         for inner_attempt in range(1, INNER_MAX_RETRIES + 1):
-            text = run_writer_fresh(theme_desc, guidance, feedback, metrics)
+            text, writer_input, writer_tokens = run_writer_fresh(
+                theme_desc, guidance, feedback, previous_attempt, metrics,
+            )
+            append_step(
+                "writer",
+                f"brain round {brain_attempt} / attempt {inner_attempt}",
+                writer_input, text, writer_tokens,
+            )
+
             check = length_checker(text, target=TARGET_LEN)
+            append_step(
+                "length_checker",
+                f"verify brain round {brain_attempt} / attempt {inner_attempt}",
+                {"text": text, "target": TARGET_LEN}, check,
+                {"in": 0, "out": 0},
+            )
 
             inner_attempts.append({
                 "attempt": inner_attempt,
@@ -197,6 +265,7 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
                 f"Previous attempt was {check['length']} characters, "
                 f"{check['delta_text']}. Adjust to exactly {TARGET_LEN}."
             )
+            previous_attempt = text   # next inner attempt revises this
 
         rounds.append({
             "brain_attempt": brain_attempt,
@@ -226,6 +295,7 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
     by_role = metrics.by_role()
     total_in = sum(r["input_tokens"] for r in by_role.values())
     total_out = sum(r["output_tokens"] for r in by_role.values())
+    writer_calls_used = sum(1 for s in trajectory if s["role"] == "writer")
 
     return {
         "theme_id": theme_id,
@@ -233,7 +303,9 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
         "run_idx": run_idx,
         "hit": hit,
         "final_length": final_length,
+        "writer_calls_used": writer_calls_used,
         "rounds": rounds,
+        "trajectory": trajectory,
         "tokens_by_role": by_role,
         "tokens_total_input": total_in,
         "tokens_total_output": total_out,
@@ -310,7 +382,7 @@ def main() -> None:
             "brain_max_attempts": BRAIN_MAX_ATTEMPTS,
             "themes": [{"id": t[0], "desc": t[1]} for t in THEMES],
             "writer_role_config": ROLE_CONFIGS["writer"],
-            "brain_role_config": ROLE_CONFIGS["brain"],
+            "brain_role_config": ROLE_CONFIGS["brain_fixed"],
         },
         "totals": {
             "runs": total_runs,
@@ -339,6 +411,13 @@ def main() -> None:
         print(f"    [{role_name}] {m['calls']} calls, "
               f"in={m['input_tokens']}, out={m['output_tokens']}")
     print(f"\nSaved: {summary_path}")
+
+    # Auto-render comparison HTML (fail-soft — other methods may be missing)
+    try:
+        from runners.story_task import html as story_html
+        story_html.main()
+    except Exception as e:
+        print(f"[warn] HTML render failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":

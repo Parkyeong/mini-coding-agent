@@ -1,19 +1,21 @@
 """Baseline story task: writer LLMNode + length-feedback retry loop.
 
-No engine.run_task involvement — this is the simplest possible "agent"
-configuration: ONE LLMNode (gpt-4o-mini, system_prompt = writer PROMPT)
-called repeatedly with feedback until len == 241 or retry budget exhausted.
+No engine, no brain — this is the simplest "agent" configuration: ONE LLMNode
+(gpt-4o-mini, system_prompt = writer PROMPT) called repeatedly with feedback
+until len == 241 or the writer-call budget is exhausted.
 
-Per task spec:
-  - 4 fixed English themes (locked across baseline / Track A / Track B)
+Per task spec (locked across baseline / method_fixed / method_brain):
+  - 4 fixed English themes
   - Strict 241 characters, zero tolerance
-  - 3 runs per theme to characterize variance
-  - Max 10 retries per run
+  - 4 runs per theme to characterize variance
+  - Max 8 writer calls per run (matches method_fixed inner budget,
+    method_brain WRITER_CALL_CAP)
   - Worker model locked to gpt-4o-mini
 
 Outputs (under WORKSHOP/story_241/baseline/):
-  <theme_id>/run_<N>.txt   — final story text (last attempt, hit or miss)
-  summary.json             — full per-run metrics + per-role token aggregation
+  <theme_id>/run_<N>.txt   — final story text (HIT or last MISS)
+  summary.json             — per-run trajectory (every writer + verify step
+                              with full input/output) + per-role token totals
 
 Usage:
   python -m runners.story_task.baseline
@@ -34,6 +36,7 @@ from config import WORKSHOP, ROLE_CONFIGS
 from llm_node import LLMNode
 from metrics import MetricsTracker
 from role_pool import writer as writer_role
+from tool_pool.text_utils import length_checker
 
 
 # ---------------------------------------------------------------------------
@@ -47,29 +50,33 @@ THEMES: list[tuple[str, str]] = [
     ("rainy_night_bus",       "The last bus on a rainy night"),
 ]
 TARGET_LEN = 241
-MAX_RETRIES = 10
-RUNS_PER_THEME = 3
+WRITER_CALL_CAP = 8                  # max writer calls per (theme, run)
+RUNS_PER_THEME = 4
 OUTPUT_SUBDIR = os.path.join("story_241", "baseline")
 
 
 # ---------------------------------------------------------------------------
-# One run = up to MAX_RETRIES attempts on a single (theme, run_idx)
+# One run = up to WRITER_CALL_CAP attempts on a single (theme, run_idx)
 # ---------------------------------------------------------------------------
 
 def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> dict:
-    """One attempt sequence on one theme. Returns metrics dict."""
+    """One attempt sequence on one theme. Returns metrics dict with trajectory."""
     metrics = MetricsTracker()
     cfg = ROLE_CONFIGS["writer"]
 
+    trajectory: list[dict] = []
+    step = 0
+
     feedback = ""
+    previous_attempt = ""    # the full text of the last attempt — passed to next
     final_story = ""
-    final_len = 0
+    final_length = 0
     hit = False
 
-    for attempt_idx in range(1, MAX_RETRIES + 1):
+    for attempt_idx in range(1, WRITER_CALL_CAP + 1):
         # Fresh LLMNode each attempt: no message-history accumulation across
         # retries (we re-build the prompt from scratch with the new feedback
-        # baked in via writer_role.build_input).
+        # + previous_attempt baked in via writer_role.build_input).
         writer = LLMNode(
             system_prompt=writer_role.PROMPT,
             role="writer",
@@ -79,21 +86,63 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
             max_tokens=cfg["max_tokens"],
             metrics_tracker=metrics,
         )
-        story = writer_role.run_writer(writer, theme=theme_desc, feedback=feedback)
-        actual_len = len(story)
+        # Build the actual user message so we can record it as the "input"
+        # (writer_role.build_input is the same fn run_writer uses internally).
+        user_input = writer_role.build_input(
+            theme=theme_desc, guidance="",
+            feedback=feedback, previous_attempt=previous_attempt,
+        )
 
-        # Always remember the latest attempt — even if all 10 miss, we save
-        # the last one (so you can read what the model gave up on).
+        n0 = len(metrics.calls)
+        writer.reset_message()
+        response = writer.run(user_input)
+        story = (response.get("text") or "").strip()
+        new_calls = metrics.calls[n0:]
+        writer_tokens = {
+            "in": sum(c.input_tokens for c in new_calls),
+            "out": sum(c.output_tokens for c in new_calls),
+        }
+
+        step += 1
+        trajectory.append({
+            "step": step,
+            "role": "writer",
+            "purpose": f"attempt #{attempt_idx}",
+            "input": user_input,
+            "output": story,
+            "tokens": writer_tokens,
+        })
+
+        # Host-side verify with length_checker (Python, no LLM cost)
+        verify = length_checker(story, target=TARGET_LEN)
+        step += 1
+        trajectory.append({
+            "step": step,
+            "role": "length_checker",
+            "purpose": f"verify attempt #{attempt_idx}",
+            "input": {"text": story, "target": TARGET_LEN},
+            "output": verify,
+            "tokens": {"in": 0, "out": 0},
+        })
+
+        # Always remember the latest attempt — even if all retries miss, we
+        # save the last one (so you can read what the model gave up on).
         final_story = story
-        final_len = actual_len
+        final_length = verify["length"]
 
-        if actual_len == TARGET_LEN:
+        if verify["hit"]:
             hit = True
             break
 
-        feedback = writer_role.build_length_feedback(actual_len, TARGET_LEN)
+        # Feed BOTH the length-diff feedback AND the full previous story
+        # text into the next attempt, so writer can revise directly.
+        feedback = (
+            f"Previous attempt was {verify['length']} characters, "
+            f"{verify['delta_text']}. Adjust to exactly {TARGET_LEN}."
+        )
+        previous_attempt = story
 
-    # Save the final story text for inspection.
+    # Save the final story for inspection
     theme_dir = os.path.join(output_dir, theme_id)
     os.makedirs(theme_dir, exist_ok=True)
     with open(os.path.join(theme_dir, f"run_{run_idx}.txt"), "w", encoding="utf-8") as f:
@@ -108,7 +157,9 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
         "theme_desc": theme_desc,
         "run_idx": run_idx,
         "hit": hit,
-        "final_length": final_len,
+        "final_length": final_length,
+        "writer_calls_used": sum(1 for s in trajectory if s["role"] == "writer"),
+        "trajectory": trajectory,
         "tokens_by_role": by_role,
         "tokens_total_input": total_in,
         "tokens_total_output": total_out,
@@ -128,10 +179,10 @@ def main() -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     started_at = datetime.now().isoformat(timespec="seconds")
-    print(f"=== Baseline story task started {started_at} ===")
+    print(f"=== baseline (story task) started {started_at} ===")
     print(f"  themes : {len(THEMES)}")
     print(f"  runs   : {RUNS_PER_THEME} per theme")
-    print(f"  retries: max {MAX_RETRIES}")
+    print(f"  budget : {WRITER_CALL_CAP} writer calls per run")
     print(f"  target : exactly {TARGET_LEN} characters")
     print(f"  output : {output_dir}")
 
@@ -142,7 +193,7 @@ def main() -> None:
             r = run_one(theme_id, theme_desc, run_idx, output_dir)
             all_results.append(r)
             status = "HIT" if r["hit"] else f"MISS (len={r['final_length']})"
-            print(f"  {status}")
+            print(f"  {status}  | writer calls used: {r['writer_calls_used']}")
             print(f"  tokens: in={r['tokens_total_input']}, out={r['tokens_total_output']}")
             for role_name, m in r["tokens_by_role"].items():
                 print(f"    [{role_name}] {m['calls']} calls, "
@@ -154,7 +205,6 @@ def main() -> None:
     sum_in = sum(r["tokens_total_input"] for r in all_results)
     sum_out = sum(r["tokens_total_output"] for r in all_results)
 
-    # Per-role aggregation across all runs (same role names sum together).
     grand_by_role: dict = {}
     for r in all_results:
         for role_name, m in r["tokens_by_role"].items():
@@ -172,7 +222,7 @@ def main() -> None:
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "config": {
             "target_len": TARGET_LEN,
-            "max_retries": MAX_RETRIES,
+            "writer_call_cap": WRITER_CALL_CAP,
             "runs_per_theme": RUNS_PER_THEME,
             "themes": [{"id": t[0], "desc": t[1]} for t in THEMES],
             "writer_role_config": ROLE_CONFIGS["writer"],
@@ -195,7 +245,7 @@ def main() -> None:
 
     print()
     print("=" * 60)
-    print(f"Baseline summary")
+    print(f"baseline summary")
     print("=" * 60)
     print(f"  hit rate     : {hits}/{total_runs} ({summary['totals']['hit_rate']:.0%})")
     print(f"  tokens total : in={sum_in}, out={sum_out}, sum={sum_in + sum_out}")
@@ -204,6 +254,13 @@ def main() -> None:
         print(f"    [{role_name}] {m['calls']} calls, "
               f"in={m['input_tokens']}, out={m['output_tokens']}")
     print(f"\nSaved: {summary_path}")
+
+    # Auto-render comparison HTML (fail-soft — other methods may be missing)
+    try:
+        from runners.story_task import html as story_html
+        story_html.main()
+    except Exception as e:
+        print(f"[warn] HTML render failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":

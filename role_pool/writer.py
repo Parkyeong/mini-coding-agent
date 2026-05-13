@@ -37,38 +37,53 @@ Other requirements:
 """
 
 
-def build_input(theme: str, guidance: str = "", feedback: str = "") -> str:
+def build_input(theme: str, guidance: str = "", feedback: str = "",
+                previous_attempt: str = "") -> str:
     """Build the user-message text fed into the writer LLMNode.
 
-    `guidance`: an optional hint set by an orchestrator (e.g. brain in
-        engine_fixed). Examples: "aim for 230 chars, be concise",
-        "use shorter sentences". Empty in baseline (no orchestrator).
-    `feedback`: the length-error message from the previous attempt, e.g.
+    `guidance`: optional hint set by an orchestrator (e.g. brain in
+        method_fixed / method_brain). Examples: "aim for 230 chars, be
+        concise". Empty in baseline (no orchestrator).
+    `feedback`: length-error message from the previous attempt, e.g.
         "Previous attempt was 256 characters, too long by 15. Adjust to
         exactly 241." Empty on the first attempt.
+    `previous_attempt`: the FULL TEXT of the previous attempt's story.
+        When non-empty, writer is asked to revise this draft to meet the
+        length target rather than write a fresh story from scratch. This
+        gives precise character-level control (trim/expand by N words).
+        Empty on the first attempt.
     """
     parts = [f"Theme: {theme}"]
     if guidance:
         parts.append("")
         parts.append(f"Guidance: {guidance}")
+    if previous_attempt:
+        parts.append("")
+        parts.append("Your previous attempt (revise this directly to hit the length target):")
+        parts.append(f'"""{previous_attempt}"""')
     if feedback:
         parts.append("")
         parts.append(feedback)
     parts.append("")
-    parts.append("Write the story now.")
+    if previous_attempt:
+        parts.append("Rewrite the story to meet the requirements.")
+    else:
+        parts.append("Write the story now.")
     return "\n".join(parts)
 
 
-def run_writer(node, theme: str, guidance: str = "", feedback: str = "") -> str:
+def run_writer(node, theme: str, guidance: str = "", feedback: str = "",
+               previous_attempt: str = "") -> str:
     """Run the writer LLMNode once and return the story text (stripped).
 
     Caller is responsible for resetting / recreating the node between attempts
     if a fresh context is wanted. Caller is also responsible for passing in
-    feedback built from the previous attempt's length error, and (optionally)
-    guidance from an upstream orchestrator.
+    feedback built from the previous attempt's length error, (optionally)
+    guidance from an upstream orchestrator, and (optionally) the previous
+    attempt's full text so writer can revise it directly.
     """
     node.reset_message()
-    result = node.run(build_input(theme, guidance, feedback))
+    result = node.run(build_input(theme, guidance, feedback, previous_attempt))
     return (result.get("text") or "").strip()
 
 

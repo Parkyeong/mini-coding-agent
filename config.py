@@ -105,12 +105,28 @@ ROLE_CONFIGS: dict[str, dict] = {
         "temperature": 0.7,
         "max_tokens": None,
     },
-    # Story task — brain is the planner / orchestrator. Uses a stronger model
-    # (4.1-mini) since planning is the expensive cognitive step, and brain is
-    # called only 1-2 times per task. max_steps=1 because brain just outputs
-    # JSON once per .run() call (no tool-call loop). Low temperature for
-    # stable plan structure.
-    "brain": {
+    # Story task — TWO brain configs, one per method, intentionally NOT
+    # sharing a model. The experimental design is:
+    #
+    #   method_brain (one-shot workflow design, no replan retry):
+    #     brain MUST be strong (gpt-5-mini) — one-shot fail = run fail.
+    #
+    #   method_fixed (brain plan + 2 brain attempts with replan):
+    #     brain has built-in retry — a cheaper model (gpt-4.1-mini) is fine
+    #     because failure on attempt 1 has a recovery path.
+    #
+    # The comparison tests "weak brain + retries" vs "strong brain + one-shot"
+    # — both methods get their natural strengths.
+    #
+    # Writer (gpt-4o-mini) is locked across both methods for fair comparison.
+    "brain": {                             # used by method_brain
+        "model": "openai/gpt-5-mini",
+        "max_steps": 1,
+        "uses_tools": False,
+        "temperature": 0.3,
+        "max_tokens": None,
+    },
+    "brain_fixed": {                       # used by method_fixed
         "model": "openai/gpt-4.1-mini",
         "max_steps": 1,
         "uses_tools": False,
