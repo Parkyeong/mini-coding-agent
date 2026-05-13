@@ -36,7 +36,14 @@ from config import WORKSHOP
 
 
 METHODS = ["baseline", "method_fixed", "method_brain"]
-BASE_DIR = os.path.join(WORKSHOP, "story_241")
+
+# If STORY_EXP_NAME is set, base path becomes story_241/<exp_name>/, matching
+# the per-method output dirs. Otherwise defaults to story_241/.
+_EXP_NAME = os.environ.get("STORY_EXP_NAME", "").strip()
+BASE_DIR = (
+    os.path.join(WORKSHOP, "story_241", _EXP_NAME) if _EXP_NAME
+    else os.path.join(WORKSHOP, "story_241")
+)
 OUTPUT_FILENAME = "comparison.html"
 
 

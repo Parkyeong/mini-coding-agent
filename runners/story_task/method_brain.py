@@ -48,16 +48,25 @@ from tool_pool.text_utils import length_checker
 # ---------------------------------------------------------------------------
 
 THEMES: list[tuple[str, str]] = [
+    # Currently scoped to 1 theme for smoke-testing. Uncomment the rest for
+    # the full 4-theme experiment.
     ("mountain_school",       "The lone teacher at a remote mountain school"),
-    ("time_displaced_store",  "A convenience store displaced in time"),
-    ("photo_studio_last_day", "The final day of an old photo studio"),
-    ("rainy_night_bus",       "The last bus on a rainy night"),
+    # ("time_displaced_store",  "A convenience store displaced in time"),
+    # ("photo_studio_last_day", "The final day of an old photo studio"),
+    # ("rainy_night_bus",       "The last bus on a rainy night"),
 ]
 TARGET_LEN = 241
 TASK_TYPE = "story"
 RUNS_PER_THEME = 4
 WRITER_CALL_CAP = 8
-OUTPUT_SUBDIR = os.path.join("story_241", "method_brain")
+
+# If STORY_EXP_NAME is set (typically by run_all.py --exp), put results
+# under story_241/<exp_name>/<method>/.
+_EXP_NAME = os.environ.get("STORY_EXP_NAME", "").strip()
+OUTPUT_SUBDIR = (
+    os.path.join("story_241", _EXP_NAME, "method_brain") if _EXP_NAME
+    else os.path.join("story_241", "method_brain")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +460,11 @@ def _call_writer(args: dict, ctx: ExecutionContext) -> str:
         "output": story,
         "tokens": tokens,
     })
+    # Per-call live log (length will be printed by the next length_checker call,
+    # but we show writer's own output length here as quick reference).
+    print(f"  writer #{ctx.writer_calls}:    "
+          f"in={tokens['in']:>5}  out={tokens['out']:>4}  "
+          f"output_len={len(story):>3}", flush=True)
     return story
 
 
@@ -475,6 +489,16 @@ def _call_length_checker(args: dict, ctx: ExecutionContext) -> dict:
         "output": result,
         "tokens": {"in": 0, "out": 0},
     })
+    # Per-call live log (paired with the most recent writer call)
+    if result.get("target") is not None:
+        diff_str = (f"(off {result['diff']:+d})" if not result.get("hit")
+                    else "        ")
+        status = "HIT" if result.get("hit") else "MISS"
+        print(f"  verify:        "
+              f"len={result['length']:>3}  {diff_str}  {status}",
+              flush=True)
+    else:
+        print(f"  verify:        len={result['length']:>3}", flush=True)
     return result
 
 
@@ -588,6 +612,9 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
     brain_response = brain.run(initial_input)
     brain_output = (brain_response.get("text") or "").strip()
     brain_calls = metrics.calls[n0:]
+    print(f"  brain design:  "
+          f"in={sum(c.input_tokens for c in brain_calls):>5}  "
+          f"out={sum(c.output_tokens for c in brain_calls):>5}", flush=True)
     brain_tokens = {
         "in": sum(c.input_tokens for c in brain_calls),
         "out": sum(c.output_tokens for c in brain_calls),
@@ -716,11 +743,14 @@ def main() -> None:
             all_results.append(r)
             status = "HIT" if r["hit"] else f"MISS (len={r['final_length']})"
             err = f"  [error: {r['error']}]" if r.get("error") else ""
-            print(f"  {status}  | writer calls used: {r['writer_calls_used']}{err}")
-            print(f"  tokens: in={r['tokens_total_input']}, out={r['tokens_total_output']}")
-            for role_name, m in r["tokens_by_role"].items():
-                print(f"    [{role_name}] {m['calls']} calls, "
-                      f"in={m['input_tokens']}, out={m['output_tokens']}")
+            by_role = r["tokens_by_role"]
+            brain_in = by_role.get("brain", {}).get("input_tokens", 0)
+            brain_out = by_role.get("brain", {}).get("output_tokens", 0)
+            writer_in = by_role.get("writer", {}).get("input_tokens", 0)
+            writer_out = by_role.get("writer", {}).get("output_tokens", 0)
+            print(f"  → run result: {status}  | writer calls: {r['writer_calls_used']}/{WRITER_CALL_CAP}{err}")
+            print(f"     tokens — brain: in={brain_in}, out={brain_out}  |  "
+                  f"writer: in={writer_in}, out={writer_out}")
 
     # ---- Aggregate ----
     total_runs = len(all_results)

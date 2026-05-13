@@ -70,17 +70,26 @@ from tool_pool.text_utils import length_checker
 # ---------------------------------------------------------------------------
 
 THEMES: list[tuple[str, str]] = [
+    # Currently scoped to 1 theme for smoke-testing. Uncomment the rest for
+    # the full 4-theme experiment.
     ("mountain_school",       "The lone teacher at a remote mountain school"),
-    ("time_displaced_store",  "A convenience store displaced in time"),
-    ("photo_studio_last_day", "The final day of an old photo studio"),
-    ("rainy_night_bus",       "The last bus on a rainy night"),
+    # ("time_displaced_store",  "A convenience store displaced in time"),
+    # ("photo_studio_last_day", "The final day of an old photo studio"),
+    # ("rainy_night_bus",       "The last bus on a rainy night"),
 ]
 TARGET_LEN = 241
 TASK_TYPE = "story"
 RUNS_PER_THEME = 4
 INNER_MAX_RETRIES = 4
 BRAIN_MAX_ATTEMPTS = 2
-OUTPUT_SUBDIR = os.path.join("story_241", "method_fixed")
+
+# If STORY_EXP_NAME is set (typically by run_all.py --exp), put results
+# under story_241/<exp_name>/<method>/.
+_EXP_NAME = os.environ.get("STORY_EXP_NAME", "").strip()
+OUTPUT_SUBDIR = (
+    os.path.join("story_241", _EXP_NAME, "method_fixed") if _EXP_NAME
+    else os.path.join("story_241", "method_fixed")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +200,8 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
             "out": sum(c.output_tokens for c in new_calls),
         }
         append_step("brain", purpose, user_input, brain_output, brain_tokens)
+        print(f"  brain {purpose:>8}:  in={brain_tokens['in']:>5}  "
+              f"out={brain_tokens['out']:>5}", flush=True)
 
         plan = brain_role.parse_plan(brain_output)
 
@@ -246,6 +257,13 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
                 {"text": text, "target": TARGET_LEN}, check,
                 {"in": 0, "out": 0},
             )
+
+            # Per-attempt live log
+            diff_str = f"(off {check['diff']:+d})" if not check["hit"] else "        "
+            status = "HIT" if check["hit"] else "MISS"
+            print(f"  R{brain_attempt} attempt {inner_attempt}:  "
+                  f"in={writer_tokens['in']:>5}  out={writer_tokens['out']:>4}  "
+                  f"len={check['length']:>3}  {diff_str}  {status}", flush=True)
 
             inner_attempts.append({
                 "attempt": inner_attempt,
@@ -340,19 +358,15 @@ def main() -> None:
             r = run_one(theme_id, theme_desc, run_idx, output_dir)
             all_results.append(r)
             status = "HIT" if r["hit"] else f"MISS (len={r['final_length']})"
-            print(f"  {status}  | brain rounds: {len(r['rounds'])}")
-            for round_idx, rnd in enumerate(r["rounds"], 1):
-                hit_str = "HIT" if rnd.get("hit") else "miss"
-                inner_lens = [a["length"] for a in rnd.get("inner_attempts", [])]
-                err = rnd.get("error")
-                if err:
-                    print(f"    round {round_idx}: ERR ({err})")
-                else:
-                    print(f"    round {round_idx}: {hit_str}, inner lengths: {inner_lens}")
-            print(f"  tokens: in={r['tokens_total_input']}, out={r['tokens_total_output']}")
-            for role_name, m in r["tokens_by_role"].items():
-                print(f"    [{role_name}] {m['calls']} calls, "
-                      f"in={m['input_tokens']}, out={m['output_tokens']}")
+            by_role = r["tokens_by_role"]
+            brain_in = by_role.get("brain", {}).get("input_tokens", 0)
+            brain_out = by_role.get("brain", {}).get("output_tokens", 0)
+            writer_in = by_role.get("writer", {}).get("input_tokens", 0)
+            writer_out = by_role.get("writer", {}).get("output_tokens", 0)
+            print(f"  → run result: {status}  | brain rounds: {len(r['rounds'])}  | "
+                  f"writer calls: {r['writer_calls_used']}")
+            print(f"     tokens — brain: in={brain_in}, out={brain_out}  |  "
+                  f"writer: in={writer_in}, out={writer_out}")
 
     # ----- Aggregate -----
     total_runs = len(all_results)

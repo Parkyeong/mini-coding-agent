@@ -44,15 +44,24 @@ from tool_pool.text_utils import length_checker
 # ---------------------------------------------------------------------------
 
 THEMES: list[tuple[str, str]] = [
+    # Currently scoped to 1 theme for smoke-testing. Uncomment the rest for
+    # the full 4-theme experiment.
     ("mountain_school",       "The lone teacher at a remote mountain school"),
-    ("time_displaced_store",  "A convenience store displaced in time"),
-    ("photo_studio_last_day", "The final day of an old photo studio"),
-    ("rainy_night_bus",       "The last bus on a rainy night"),
+    # ("time_displaced_store",  "A convenience store displaced in time"),
+    # ("photo_studio_last_day", "The final day of an old photo studio"),
+    # ("rainy_night_bus",       "The last bus on a rainy night"),
 ]
 TARGET_LEN = 241
 WRITER_CALL_CAP = 8                  # max writer calls per (theme, run)
 RUNS_PER_THEME = 4
-OUTPUT_SUBDIR = os.path.join("story_241", "baseline")
+
+# If STORY_EXP_NAME is set (typically by run_all.py --exp), put results
+# under story_241/<exp_name>/<method>/. Otherwise default to story_241/<method>/.
+_EXP_NAME = os.environ.get("STORY_EXP_NAME", "").strip()
+OUTPUT_SUBDIR = (
+    os.path.join("story_241", _EXP_NAME, "baseline") if _EXP_NAME
+    else os.path.join("story_241", "baseline")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +134,13 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
             "tokens": {"in": 0, "out": 0},
         })
 
+        # Per-attempt live log
+        diff_str = f"(off {verify['diff']:+d})" if not verify["hit"] else "        "
+        status = "HIT" if verify["hit"] else "MISS"
+        print(f"  attempt {attempt_idx}: in={writer_tokens['in']:>5}  "
+              f"out={writer_tokens['out']:>4}  len={verify['length']:>3}  {diff_str}  {status}",
+              flush=True)
+
         # Always remember the latest attempt — even if all retries miss, we
         # save the last one (so you can read what the model gave up on).
         final_story = story
@@ -193,11 +209,8 @@ def main() -> None:
             r = run_one(theme_id, theme_desc, run_idx, output_dir)
             all_results.append(r)
             status = "HIT" if r["hit"] else f"MISS (len={r['final_length']})"
-            print(f"  {status}  | writer calls used: {r['writer_calls_used']}")
-            print(f"  tokens: in={r['tokens_total_input']}, out={r['tokens_total_output']}")
-            for role_name, m in r["tokens_by_role"].items():
-                print(f"    [{role_name}] {m['calls']} calls, "
-                      f"in={m['input_tokens']}, out={m['output_tokens']}")
+            print(f"  → run result: {status}  | writer calls used: {r['writer_calls_used']}/{WRITER_CALL_CAP}"
+                  f"  | tokens: in={r['tokens_total_input']}, out={r['tokens_total_output']}")
 
     # Aggregate
     total_runs = len(all_results)
