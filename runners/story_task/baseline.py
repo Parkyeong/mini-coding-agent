@@ -79,7 +79,7 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
             max_tokens=cfg["max_tokens"],
             metrics_tracker=metrics,
         )
-        story = writer_role.run_writer(writer, theme_desc, feedback)
+        story = writer_role.run_writer(writer, theme=theme_desc, feedback=feedback)
         actual_len = len(story)
 
         # Always remember the latest attempt — even if all 10 miss, we save

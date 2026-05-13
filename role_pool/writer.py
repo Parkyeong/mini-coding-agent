@@ -1,10 +1,24 @@
 """Writer role: flash-fiction creative writing under a strict length constraint.
 
 The actual LLM call goes through an LLMNode instance configured for this
-role. Used by the story_task runners (baseline / Track A / Track B). The
-worker model is locked to gpt-4o-mini in ROLE_CONFIGS — orchestrating roles
-(brain in Track A) may use stronger models, but the prose itself is always
+role. Used by the story_task runners (baseline / engine_fixed / engine_brain).
+The worker model is locked to gpt-4o-mini in ROLE_CONFIGS — orchestrating
+roles (brain) may use stronger models, but the prose itself is always
 4o-mini for fair cross-method comparison.
+"""
+
+# ---------------------------------------------------------------------------
+# Brain-facing metadata
+# ---------------------------------------------------------------------------
+# Used by role_pool/brain.py's get_visible_roles() to filter the pool menu
+# shown to brain by task_type. The brain doesn't see roles whose task type
+# doesn't match the current task.
+SUPPORTED_TASKS = ["story"]
+
+BRAIN_DESCRIPTION = """writer (LLM worker, gpt-4o-mini):
+    Args: theme (str, required), guidance (str, optional)
+    Returns: draft story text
+    Notes: tends to over/undershoot length targets by 5-30 characters.
 """
 
 PROMPT = """You are a flash fiction writer.
@@ -23,14 +37,20 @@ Other requirements:
 """
 
 
-def build_input(theme: str, feedback: str = "") -> str:
+def build_input(theme: str, guidance: str = "", feedback: str = "") -> str:
     """Build the user-message text fed into the writer LLMNode.
 
-    `feedback` is the length-error message from the previous attempt, e.g.
-    "Previous attempt was 256 characters, too long by 15. Adjust to exactly
-    241." Empty on the first attempt.
+    `guidance`: an optional hint set by an orchestrator (e.g. brain in
+        engine_fixed). Examples: "aim for 230 chars, be concise",
+        "use shorter sentences". Empty in baseline (no orchestrator).
+    `feedback`: the length-error message from the previous attempt, e.g.
+        "Previous attempt was 256 characters, too long by 15. Adjust to
+        exactly 241." Empty on the first attempt.
     """
     parts = [f"Theme: {theme}"]
+    if guidance:
+        parts.append("")
+        parts.append(f"Guidance: {guidance}")
     if feedback:
         parts.append("")
         parts.append(feedback)
@@ -39,15 +59,16 @@ def build_input(theme: str, feedback: str = "") -> str:
     return "\n".join(parts)
 
 
-def run_writer(node, theme: str, feedback: str = "") -> str:
+def run_writer(node, theme: str, guidance: str = "", feedback: str = "") -> str:
     """Run the writer LLMNode once and return the story text (stripped).
 
     Caller is responsible for resetting / recreating the node between attempts
     if a fresh context is wanted. Caller is also responsible for passing in
-    feedback built from the previous attempt's length error.
+    feedback built from the previous attempt's length error, and (optionally)
+    guidance from an upstream orchestrator.
     """
     node.reset_message()
-    result = node.run(build_input(theme, feedback))
+    result = node.run(build_input(theme, guidance, feedback))
     return (result.get("text") or "").strip()
 
 

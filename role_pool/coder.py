@@ -9,6 +9,15 @@ This module is config + helpers, not a class. The "coder" runtime object is
 the LLMNode instance built in engine.py.
 """
 
+# Brain-facing metadata (see role_pool/brain.py for how this is used).
+SUPPORTED_TASKS = ["code"]
+
+BRAIN_DESCRIPTION = """coder (LLM worker, gpt-4o-mini):
+    Args: step (str, the current plan step to execute), memory (working memory)
+    Returns: completion result (writes code to solution.py via fs/shell tools)
+    Notes: uses tool_pool/ops.py internally; runs tests after writing.
+"""
+
 PROMPT = """
 You are a professional coding agent.
 **Your scope is strictly limited to the workspace. You cannot access anything outside of the workspace.**

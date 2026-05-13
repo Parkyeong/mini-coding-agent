@@ -96,13 +96,25 @@ ROLE_CONFIGS: dict[str, dict] = {
     },
     # Story task — gpt-4o-mini is locked here per the story-task spec
     # (the worker writing the actual prose must be 4o-mini for fairness across
-    # baseline / Track A / Track B). Temperature is moderate to allow some
-    # creative variability while staying coherent.
+    # baseline / engine_fixed / engine_brain). Temperature is moderate to
+    # allow some creative variability while staying coherent.
     "writer": {
         "model": "openai/gpt-4o-mini",
         "max_steps": 1,
         "uses_tools": False,
         "temperature": 0.7,
+        "max_tokens": None,
+    },
+    # Story task — brain is the planner / orchestrator. Uses a stronger model
+    # (4.1-mini) since planning is the expensive cognitive step, and brain is
+    # called only 1-2 times per task. max_steps=1 because brain just outputs
+    # JSON once per .run() call (no tool-call loop). Low temperature for
+    # stable plan structure.
+    "brain": {
+        "model": "openai/gpt-4.1-mini",
+        "max_steps": 1,
+        "uses_tools": False,
+        "temperature": 0.3,
         "max_tokens": None,
     },
 }

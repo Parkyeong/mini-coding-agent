@@ -23,6 +23,11 @@ from __future__ import annotations
 import json
 import re
 
+# Brain-facing metadata: summarizer is invoked by the engine post-task, not
+# brain-dispatched, so it has no SUPPORTED_TASKS (empty list = invisible to
+# brain). BRAIN_DESCRIPTION is omitted for the same reason.
+SUPPORTED_TASKS: list[str] = []
+
 PROMPT = """You review the trace of a COMPLETED coding task — including the plan that
 was made, the code the agent wrote, the test results, and any retry/replan
 that happened — and extract 1-2 generalizable lessons about the PROJECT.

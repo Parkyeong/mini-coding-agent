@@ -15,6 +15,11 @@ cheaper model (config.ROLE_CONFIGS["dedup"]["model"], default gpt-4o-mini).
 Used by memory.merge_facts_into_global when ENABLE_LLM_DEDUP is on.
 """
 
+# Brain-facing metadata: dedup is invoked by the memory subsystem during
+# fact merge, not brain-dispatched. Empty SUPPORTED_TASKS hides it from
+# brain's menu.
+SUPPORTED_TASKS: list[str] = []
+
 import re
 
 PROMPT = """You decide whether two facts about a software project mean the same thing.

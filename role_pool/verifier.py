@@ -12,6 +12,16 @@ LLMNode tool loop (coder's choice) and silently misses the engine-mandated
 ones (one per coder iteration).
 """
 
+# Brain-facing metadata.
+SUPPORTED_TASKS = ["code"]
+
+BRAIN_DESCRIPTION = """verifier (Python function, no LLM):
+    Args: memory (working memory), env (Environment with workspace)
+    Returns: {"passed": bool, "reason": str, "fix_suggestion": str, "test_block": str}
+    Notes: runs pytest in the workspace, returns pass/fail + failure tail
+           as fix_suggestion for the next coder retry.
+"""
+
 from config import VERIFIER_RUN_TESTS
 from tool_pool.test_runner import run_tests
 

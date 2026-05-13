@@ -8,6 +8,16 @@ This module is config + helpers, not a class. The "planner" runtime object is
 the LLMNode instance built in engine.py.
 """
 
+# Brain-facing metadata.
+SUPPORTED_TASKS = ["code"]
+
+BRAIN_DESCRIPTION = """planner (LLM worker, gpt-4o-mini):
+    Args: user_task (str), memory_context (str, optional), failure_context (str, optional)
+    Returns: list of 3-6 plan steps (strings)
+    Notes: breaks coding tasks into actionable steps. Each step is meant for
+           the coder role to execute.
+"""
+
 PROMPT = """You are a task planning expert for a coding agent.
 The user will give you a coding task and optionally some project context.
 
