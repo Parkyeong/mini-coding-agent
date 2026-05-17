@@ -23,8 +23,13 @@ def length_checker(text: str, target: int = None) -> dict:
             {"length": <int>}
         With target=<int>:
             {"length": <int>, "target": <int>, "diff": <int>,
-             "hit": <bool>, "delta_text": <str>}
-            where delta_text is "exactly on target" / "too long by N" / "too short by N"
+             "absdiff": <int>, "hit": <bool>, "delta_text": <str>}
+            - diff:    signed (length - target). >0 over, <0 under, 0 exact.
+            - absdiff: |diff|. Use this in DSL `if` conditions when comparing
+                       two candidates by closeness to the target — signed
+                       comparison flips intuition when one is short and the
+                       other is long.
+            - delta_text: "exactly on target" / "too long by N" / "too short by N"
     """
     actual = len(text)
     if target is None:
@@ -34,6 +39,7 @@ def length_checker(text: str, target: int = None) -> dict:
         "length": actual,
         "target": target,
         "diff": diff,
+        "absdiff": abs(diff),
         "hit": diff == 0,
         "delta_text": (
             "exactly on target" if diff == 0
@@ -55,8 +61,18 @@ BRAIN_TOOLS = {
         "supported_tasks": ["story"],
         "description": """length_checker (Python function, no LLM):
     Args: text (str, required), target (int, optional)
-    Returns: dict with length / diff / hit fields
-    Notes: returns exact character count via Python len().""",
+    Returns when target given: {length, target, diff, absdiff, hit, delta_text}
+      - diff:    signed (length - target). $check.diff < 0 means too short;
+                 $check.diff > 0 means too long.
+      - absdiff: |diff|. USE THIS when comparing two candidates' closeness
+                 to target (e.g. `$check_short.absdiff <= $check_long.absdiff`).
+                 Signed diff comparison flips intuition: short-draft.diff is
+                 negative and long-draft.diff is positive, so a signed
+                 comparison would always pick the short one regardless of
+                 which is actually closer.
+      - hit:     True iff diff == 0.
+      - delta_text: human-readable "too long by N" / "too short by N" / "exactly on target".
+    Notes: returns exact character count via Python len(). No LLM cost.""",
         "callable": length_checker,
     },
 }

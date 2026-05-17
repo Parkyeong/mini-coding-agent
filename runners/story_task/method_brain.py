@@ -1,22 +1,29 @@
-"""method_brain — brain designs a workflow program, host interprets it.
+"""method_brain — per cycle: brain designs a workflow, host executes it.
 
-Single-file architecture for X2: BRAIN_PROMPT + DSL interpreter + runner.
+Per (theme, run): the host runs NUM_CYCLES = 8 outer cycles. Each cycle:
 
-How it differs from method_fixed:
-  - method_fixed: brain outputs simple plan (writer guidance), host has
-    hardcoded retry loop (4 inner × 2 brain attempts = 8 writer calls)
-  - method_brain: brain outputs a full workflow PROGRAM in a small JSON DSL
-    (sequence/loop/call/if/return + variables). Host is a generic
-    interpreter for this DSL — it does NOT hardcode the retry shape.
-    Brain decides loop counts, when to stop, multi-phase strategies, etc.
+    1. brain (gpt-5-mini) designs a workflow JSON program in the DSL
+       (sequence / loop / if / call / return + variables). Brain sees:
+         - the theme
+         - cross-run memory (previous runs of this theme; last-cycle
+           snapshot only)
+         - within-run history (all previous cycles in THIS run: each
+           cycle's workflow JSON, final story, length, hit, strategy_notes)
+    2. host executes that workflow via the DSL interpreter, invoking
+       writer / length_checker as the workflow directs.
+    3. cycle outcome (final story + length + hit) is recorded; appended
+       to the within-run history so the NEXT cycle's brain sees it.
 
-The brain (4.1-mini) is INDEPENDENT of role_pool — it's not a role itself,
-it consumes role_pool / tool_pool as a menu via discovery functions. Workers
-(writer, length_checker) do the actual work, dispatched by host's executor.
+Comparison fairness across methods is on the "agent main loop iteration
+count" axis (= 8), matching baseline (8 writer-verify retries) and
+method_fixed (8 cycles of writer-verify × 3 + textplanner).
 
-Budget cap: 8 writer calls per (theme, run). Matches method_fixed / baseline.
-If brain writes a workflow that tries to call writer 9+ times, host silently
-skips the excess and records BUDGET_EXHAUSTED in the trajectory.
+Per-cycle writer cap: brain's workflow may call writer AT MOST 3 times
+per cycle (host hard cap, matching method_fixed's writer-per-cycle).
+Writer calls beyond the cap within a single cycle are silently skipped
+(BUDGET_EXHAUSTED recorded in trajectory). Cap resets each cycle.
+
+HIT in any cycle's verifier = run ends successfully (no further cycles).
 
 Usage:
   python -m runners.story_task.method_brain
@@ -47,18 +54,34 @@ from tool_pool.text_utils import length_checker
 # Task spec
 # ---------------------------------------------------------------------------
 
-THEMES: list[tuple[str, str]] = [
-    # Currently scoped to 1 theme for smoke-testing. Uncomment the rest for
-    # the full 4-theme experiment.
+# All 4 canonical themes — filtered at runtime by STORY_THEMES env var.
+_AVAILABLE_THEMES: list[tuple[str, str]] = [
     ("mountain_school",       "The lone teacher at a remote mountain school"),
-    # ("time_displaced_store",  "A convenience store displaced in time"),
-    # ("photo_studio_last_day", "The final day of an old photo studio"),
-    # ("rainy_night_bus",       "The last bus on a rainy night"),
+    ("time_displaced_store",  "A convenience store displaced in time"),
+    ("photo_studio_last_day", "The final day of an old photo studio"),
+    ("rainy_night_bus",       "The last bus on a rainy night"),
 ]
+
+# Runtime filtering — set STORY_THEMES / STORY_RUNS_PER_THEME (typically via
+# run_all.py --themes / --runs) to scope the experiment.
+_theme_filter = os.environ.get("STORY_THEMES", "").strip()
+if _theme_filter:
+    _wanted = {t.strip() for t in _theme_filter.split(",") if t.strip()}
+    THEMES = [t for t in _AVAILABLE_THEMES if t[0] in _wanted]
+else:
+    THEMES = list(_AVAILABLE_THEMES)
+
+RUNS_PER_THEME = int(os.environ.get("STORY_RUNS_PER_THEME", "4"))
 TARGET_LEN = 241
 TASK_TYPE = "story"
-RUNS_PER_THEME = 4
-WRITER_CALL_CAP = 8
+
+# Outer agent loop: 8 cycles, matching baseline's 8 retries and method_fixed's
+# 8 cycles. Per-cycle writer cap is the host hard limit on writer calls within
+# one workflow execution; cap resets each cycle. With NUM_CYCLES=8 and
+# WRITER_CALL_CAP_PER_CYCLE=3, worst case = 24 writer calls + 8 brain calls
+# per run (no early HIT). HIT in any cycle exits the run early.
+NUM_CYCLES = 8
+WRITER_CALL_CAP_PER_CYCLE = 3
 
 # If STORY_EXP_NAME is set (typically by run_all.py --exp), put results
 # under story_241/<exp_name>/<method>/.
@@ -73,12 +96,14 @@ OUTPUT_SUBDIR = (
 # BRAIN PROMPT
 # ---------------------------------------------------------------------------
 
-BRAIN_PROMPT_TEMPLATE = """You are a workflow architect. Design a workflow
-PROGRAM (in the JSON DSL below) to accomplish the user's task.
+BRAIN_PROMPT_TEMPLATE = """You are a workflow architect operating in an
+ITERATIVE outer loop. Your job each turn is to design ONE workflow PROGRAM
+(in the JSON DSL below) for THIS cycle of an 8-cycle agent loop.
 
 You do NOT execute the workflow yourself — a Python interpreter will run it.
-Your job is to design what shape the workflow takes (loops, conditionals,
-sequencing, when to stop) and which roles/tools each step invokes.
+After execution, the host calls YOU AGAIN with the cycle's outcome appended
+to the within-run history, and you design the NEXT cycle's workflow. The
+loop ends early when any verifier returns HIT (length == 241).
 
 # Workflow DSL
 
@@ -152,63 +177,140 @@ Examples:
 
 # Execution constraints (FIXED by host, you cannot bypass)
 
-- **Budget: max {writer_cap} writer calls total per task.** If your workflow
-  tries to invoke writer beyond this, host will silently skip the excess
-  calls and continue (the variable `save_as` for the skipped call will not
-  be set, so subsequent `$<var>` references resolve to empty).
-- SUCCESS condition: the final `save_as` value of the last successful writer
-  call must produce a story of EXACTLY 241 characters. Use length_checker to
-  verify; the host considers the run a HIT iff the latest writer output has
-  length 241.
-- Aim to use few writer calls when possible (token cost matters).
+- **Per-cycle writer cap: {writer_cap} writer calls.** Within ONE cycle's
+  workflow, host silently skips any writer call beyond #{writer_cap}
+  (the skipped call's `save_as` won't be set). Cap resets next cycle —
+  you have {total_cycles} cycles total, so up to {total_writer_max}
+  writer calls across the whole run.
+- SUCCESS: any length_checker call returning length == 241 ends the run
+  immediately. Use length_checker after every writer call so the host can
+  detect HIT.
+- Within a cycle, design a small focused workflow (1-3 writer calls).
+  The OUTER loop is what re-tries with new strategy — don't try to bake
+  the whole task into one cycle's workflow.
 
-# Example workflow
+# Example workflow — "bracket-and-fix" (empirically effective pattern)
 
-A simple single-loop with feedback-driven revision. On each iteration after
-the first, writer sees `$draft` (the previous story text) AND `$last.delta_text`
-(the length error). On the first iteration both resolve to "" and writer
-starts fresh.
+This is a 3-writer pattern that has been shown to converge well within one
+cycle. The shape:
+
+  1. FRESH DRAFT aiming UNDER target (~231 chars)
+  2. FRESH DRAFT aiming OVER target (~251 chars)
+  3. MINIMAL EDIT on one of them (host auto-direction does the precise
+     delete/append based on its actual length)
+
+Why it works:
+  - Two opposing fresh drafts bracket the target — the closer one is at
+    most ~10 chars away. Host's auto-direction shines for small N.
+  - Each fresh draft is INDEPENDENT (no shared previous_attempt) so writer
+    doesn't get stuck in a fixed point (a recurring failure mode of
+    single-draft retry loops).
+  - The final-stage `guidance` REINFORCES host's tail-edit semantics
+    ("tighten the ending") rather than fighting it.
 
 ```json
 {{
-  "strategy_notes": "Single phase. Writer revises $draft based on $last.delta_text. First iter both are empty so it starts fresh.",
+  "strategy_notes": "Bracket-and-fix: produce two fresh drafts above and below the target as a length envelope, then minimal-edit one of them down/up to 241. Final-stage guidance reinforces host's tail-trim semantics.",
   "workflow": {{
-    "type": "loop",
-    "max_iter": 8,
-    "until": "$last.hit == true",
-    "body": {{
-      "type": "sequence",
-      "steps": [
-        {{
+    "type": "sequence",
+    "steps": [
+      {{
+        "type": "call",
+        "role": "writer",
+        "args": {{
+          "theme": "$theme",
+          "guidance": "Fresh concise draft. Aim ~231 chars (just under target).",
+          "previous_attempt": ""
+        }},
+        "save_as": "draft_short"
+      }},
+      {{
+        "type": "call",
+        "tool": "length_checker",
+        "args": {{"text": "$draft_short", "target": "$target_len"}},
+        "save_as": "check_short"
+      }},
+      {{
+        "type": "if",
+        "condition": "$check_short.hit == true",
+        "then": {{"type": "return", "value": "$draft_short"}}
+      }},
+      {{
+        "type": "call",
+        "role": "writer",
+        "args": {{
+          "theme": "$theme",
+          "guidance": "Fresh vivid draft. Aim ~251 chars (just over target).",
+          "previous_attempt": ""
+        }},
+        "save_as": "draft_long"
+      }},
+      {{
+        "type": "call",
+        "tool": "length_checker",
+        "args": {{"text": "$draft_long", "target": "$target_len"}},
+        "save_as": "check_long"
+      }},
+      {{
+        "type": "if",
+        "condition": "$check_long.hit == true",
+        "then": {{"type": "return", "value": "$draft_long"}}
+      }},
+      {{
+        "type": "if",
+        "condition": "$check_short.absdiff <= $check_long.absdiff",
+        "then": {{
           "type": "call",
           "role": "writer",
           "args": {{
             "theme": "$theme",
-            "guidance": "aim 241 exactly; story arc with strong ending",
-            "previous_attempt": "$draft",
-            "feedback": "$last.delta_text"
+            "guidance": "Tighten the ending only. Preserve plot and tone.",
+            "previous_attempt": "$draft_short"
           }},
-          "save_as": "draft"
+          "save_as": "draft_final"
         }},
-        {{
+        "else": {{
           "type": "call",
-          "tool": "length_checker",
-          "args": {{"text": "$draft", "target": "$target_len"}},
-          "save_as": "last"
+          "role": "writer",
+          "args": {{
+            "theme": "$theme",
+            "guidance": "Tighten the ending only. Preserve plot and tone.",
+            "previous_attempt": "$draft_long"
+          }},
+          "save_as": "draft_final"
         }}
-      ]
-    }}
+      }},
+      {{
+        "type": "call",
+        "tool": "length_checker",
+        "args": {{"text": "$draft_final", "target": "$target_len"}},
+        "save_as": "last"
+      }}
+    ]
   }}
 }}
 ```
 
-Writer's recognized args: `theme`, `guidance`, `feedback`, `previous_attempt`.
-Pass `previous_attempt` for precise char-level revision (recommended for
-length-constrained tasks).
+NOTE on the candidate-comparison: we use `$check_short.absdiff <=
+$check_long.absdiff` (absolute distance) NOT `$check_short.diff <=
+$check_long.diff`. The signed diff comparison flips intuition — short
+draft.diff is negative, long draft.diff is positive, so signed comparison
+would always pick the short branch regardless of which is actually closer.
+Use `.absdiff` whenever you're comparing closeness across candidates.
 
-You don't have to use this shape — you can design any control flow that fits
-the task. Multi-phase strategies (try guidance A first, then switch to B if
-A keeps overshooting) are legitimate uses of the DSL.
+Writer's recognized args: `theme`, `guidance`, `previous_attempt`. See the
+writer role description above for FRESH DRAFT vs MINIMAL EDIT mode rules.
+
+You don't have to use this shape. Other valid patterns:
+  - Single-draft + iterative minimal-edit (simple, slower convergence)
+  - Multi-phase: try one strategy, branch via `if` to a different
+    strategy if the first misses
+  - Style-constrained drafts (e.g. "three short sentences, no names")
+    to reduce variance before minimal-edit
+
+You have multiple cycles in the outer loop, so don't try to bake the
+whole task into a single cycle's workflow. Pick a focused 1-3 writer
+call shape per cycle.
 
 # Output format
 
@@ -227,16 +329,179 @@ def build_brain_system_prompt() -> str:
     return BRAIN_PROMPT_TEMPLATE.format(
         role_block=role_block,
         tool_block=tool_block,
-        writer_cap=WRITER_CALL_CAP,
+        writer_cap=WRITER_CALL_CAP_PER_CYCLE,
+        total_cycles=NUM_CYCLES,
+        total_writer_max=NUM_CYCLES * WRITER_CALL_CAP_PER_CYCLE,
     )
 
 
-def build_initial_input(theme_desc: str, target_len: int = TARGET_LEN) -> str:
-    return (
-        f"Task: Write a story about: {theme_desc}\n"
-        f"Requirement: exactly {target_len} characters.\n\n"
-        f"Design your workflow. Output JSON only."
-    )
+def _render_cross_run_memory_block(memory_context: list[dict]) -> str:
+    """Cross-run memory: previous RUNS of the same theme.
+
+    Each record contains TWO cycle snapshots:
+      - last_cycle:    the cycle where the run ended (Pass cycle for
+                       successful runs; safe fallback for failed runs).
+      - nearest_cycle: the cycle with the smallest |final_length - 241|
+                       across that run. For Pass runs this equals last_cycle.
+                       For Fail runs this exposes the most promising attempt
+                       that didn't quite make it (preserves info that would
+                       be lost if we stored only last).
+
+    Record shape:
+      {run_idx, cycles_used, hit, final_length,
+       last_cycle: {cycle, final_length, hit, strategy_notes, workflow_json},
+       nearest_cycle: {same fields}}
+    """
+    if not memory_context:
+        return ""
+
+    def _render_snapshot(label: str, snap: dict | None) -> list[str]:
+        if not snap:
+            return []
+        cyc = snap.get("cycle", "?")
+        fl = snap.get("final_length", "?")
+        passed = "Pass" if snap.get("hit") else "Fail"
+        out = [f"**{label}** (cycle {cyc}, length {fl}, {passed}):"]
+        sn = (snap.get("strategy_notes") or "").strip()
+        if sn:
+            out.append(f"strategy_notes: {sn}")
+        wf = snap.get("workflow_json")
+        if wf is not None:
+            try:
+                wf_str = json.dumps(wf, ensure_ascii=False, indent=2)
+            except Exception:
+                wf_str = str(wf)
+            out.append("workflow:")
+            out.append("```json")
+            out.append(wf_str)
+            out.append("```")
+        return out
+
+    lines = [
+        "## Cross-run memory (previous runs of this SAME theme)",
+        "",
+        "Snapshots are filtered to STRATEGY-VALIDATED cycles only — i.e.",
+        "cycles where the planned multi-step workflow actually ran (not",
+        "cycles where writer #1 luck-hit 241 before any later step had",
+        "a chance to execute). This filters out false positives so you",
+        "learn from real strategy contributions, not coincidences.",
+        "",
+        "Each previous run gives up to two snapshots:",
+        "  - LAST cycle: the last validated cycle in that run",
+        "  - NEAREST cycle: validated cycle with the smallest",
+        "    |final_length - 241| (= LAST if same; differs when an earlier",
+        "    cycle was closer than where the run finally ended)",
+        "",
+        "If a run had NO validated cycles, snapshots are absent — that",
+        "run's apparent Pass (if any) was first-writer cold-start luck",
+        "and carries NO strategy signal. Treat that run as 'no learning'.",
+        "",
+        "EXPLORATION NOTE: a strategy that came close ONCE may fail again.",
+        "Don't just copy nearest-cycle workflows verbatim — consider",
+        "variations, hybrid approaches, or genuinely different shapes when",
+        "two or more past runs converge on the same near-miss pattern.",
+        "",
+    ]
+    for m in memory_context:
+        run_idx = m.get("run_idx", "?")
+        cycles_used = m.get("cycles_used", "?")
+        outcome = "Pass" if m.get("hit") else "Fail"
+        had_validated = m.get("had_validated_strategy", True)
+        lines.append(f"### Run {run_idx} ({cycles_used} cycles, {outcome})")
+
+        if not had_validated:
+            lines.append(
+                f"(No validated cycle in this run — any Pass was "
+                f"cold-start luck on writer #1; no strategy signal.)"
+            )
+            lines.append("")
+            continue
+
+        last_c = m.get("last_cycle")
+        near_c = m.get("nearest_cycle")
+        lines.extend(_render_snapshot("LAST cycle (validated)", last_c))
+
+        if near_c and last_c and near_c.get("cycle") != last_c.get("cycle"):
+            lines.extend(_render_snapshot("NEAREST cycle (validated)", near_c))
+        elif near_c and last_c and near_c.get("cycle") == last_c.get("cycle"):
+            lines.append("(NEAREST cycle is the same as LAST cycle.)")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _render_within_run_history_block(history: list[dict]) -> str:
+    """Within-run history: each cycle of THIS run that has already executed.
+
+    Record shape: {cycle, workflow_json, final_story, final_length, hit,
+                   strategy_notes}
+
+    Brain sees ALL past cycles in this run, including each cycle's full
+    workflow JSON and the final story text (so it can adjust strategy
+    based on what was actually produced).
+    """
+    if not history:
+        return ""
+    lines = [
+        "## Within-run history (cycles you have already designed in THIS run)",
+        "",
+    ]
+    for c in history:
+        cycle_idx = c.get("cycle", "?")
+        outcome = "Pass" if c.get("hit") else "Fail"
+        final_len = c.get("final_length", "?")
+        lines.append(f"### Cycle {cycle_idx} ({outcome}, final length {final_len})")
+        sn = (c.get("strategy_notes") or "").strip()
+        if sn:
+            lines.append(f"strategy_notes: {sn}")
+        wf = c.get("workflow_json")
+        if wf is not None:
+            try:
+                wf_str = json.dumps(wf, ensure_ascii=False, indent=2)
+            except Exception:
+                wf_str = str(wf)
+            lines.append("workflow:")
+            lines.append("```json")
+            lines.append(wf_str)
+            lines.append("```")
+        fs = (c.get("final_story") or "").strip()
+        if fs:
+            lines.append(f"final_story ({len(fs)} chars):")
+            lines.append(f"  \"{fs}\"")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def build_cycle_input(theme_desc: str, cycle_idx: int, total_cycles: int,
+                      target_len: int = TARGET_LEN,
+                      cross_run_memory: list[dict] | None = None,
+                      within_run_history: list[dict] | None = None) -> str:
+    """Build the user-message text for brain at the start of one cycle."""
+    parts = [
+        f"## Task",
+        f"Write a story about: {theme_desc}",
+        f"Requirement: exactly {target_len} characters.",
+        "",
+        f"## Cycle position",
+        f"You are at the START of cycle {cycle_idx} of {total_cycles}.",
+        f"Cycles remaining (including this one): {total_cycles - cycle_idx + 1}.",
+        "",
+    ]
+    cross_block = _render_cross_run_memory_block(cross_run_memory or [])
+    if cross_block:
+        parts.append(cross_block)
+    within_block = _render_within_run_history_block(within_run_history or [])
+    if within_block:
+        parts.append(within_block)
+    parts.append("## Your turn")
+    if (cross_run_memory or within_run_history):
+        parts.append(
+            "Design the cycle-" + str(cycle_idx) + " workflow JSON. If past "
+            "attempts kept missing, change strategy meaningfully — don't repeat "
+            "the same shape. Output JSON only."
+        )
+    else:
+        parts.append("Design your cycle-1 workflow JSON. Output JSON only.")
+    return "\n".join(parts)
 
 
 def parse_workflow(brain_output_text: str) -> dict | None:
@@ -289,7 +554,7 @@ class ExecutionContext:
         self.metrics = metrics
         self.trajectory = trajectory
         self.writer_calls = 0
-        self.writer_cap = WRITER_CALL_CAP
+        self.writer_cap = WRITER_CALL_CAP_PER_CYCLE
         self.step = starting_step
         self.returned = False
         self.return_value = None
@@ -460,11 +725,8 @@ def _call_writer(args: dict, ctx: ExecutionContext) -> str:
         "output": story,
         "tokens": tokens,
     })
-    # Per-call live log (length will be printed by the next length_checker call,
-    # but we show writer's own output length here as quick reference).
-    print(f"  writer #{ctx.writer_calls}:    "
-          f"in={tokens['in']:>5}  out={tokens['out']:>4}  "
-          f"output_len={len(story):>3}", flush=True)
+    # Note: verifier line follows in _call_length_checker, so we don't log here.
+    # Brain's workflow always pairs each writer with a length_checker call.
     return story
 
 
@@ -489,16 +751,17 @@ def _call_length_checker(args: dict, ctx: ExecutionContext) -> dict:
         "output": result,
         "tokens": {"in": 0, "out": 0},
     })
-    # Per-call live log (paired with the most recent writer call)
+    # Per-call live log (paired with the most recent writer call).
+    # Only pass/fail + length + diff (token info goes to summary.json).
     if result.get("target") is not None:
-        diff_str = (f"(off {result['diff']:+d})" if not result.get("hit")
-                    else "        ")
-        status = "HIT" if result.get("hit") else "MISS"
-        print(f"  verify:        "
-              f"len={result['length']:>3}  {diff_str}  {status}",
-              flush=True)
+        diff_str = (f"diff={result['diff']:+d}" if not result.get("hit")
+                    else "diff=  0")
+        status = "Pass" if result.get("hit") else "Fail"
+        print(f"  writer #{ctx.writer_calls}→verify: {status}  "
+              f"len={result['length']:>3}  {diff_str}", flush=True)
     else:
-        print(f"  verify:        len={result['length']:>3}", flush=True)
+        print(f"  writer #{ctx.writer_calls}→verify: len={result['length']:>3}",
+              flush=True)
     return result
 
 
@@ -533,8 +796,8 @@ def execute(node, ctx: ExecutionContext, depth: int = 0) -> None:
         body = node.get("body")
         if body is None:
             return
-        # Hard safety cap: never let max_iter exceed WRITER_CALL_CAP * 4.
-        max_iter = min(max_iter, WRITER_CALL_CAP * 4)
+        # Hard safety cap: never let max_iter exceed per-cycle cap * 4.
+        max_iter = min(max_iter, WRITER_CALL_CAP_PER_CYCLE * 4)
         for _ in range(max_iter):
             execute(body, ctx, depth + 1)
             if ctx.returned:
@@ -592,111 +855,183 @@ def execute(node, ctx: ExecutionContext, depth: int = 0) -> None:
 # Per-run flow
 # ---------------------------------------------------------------------------
 
-def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> dict:
+def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str,
+            memory_context: list[dict] | None = None) -> dict:
+    """One (theme, run_idx) pass through NUM_CYCLES outer cycles.
+
+    Each cycle: brain (fresh LLMNode) → designs workflow → host executes it
+    via the DSL interpreter → outcome recorded. The next cycle's brain sees
+    all prior cycles' workflows / outcomes / final stories.
+
+    `memory_context` — cross-run memory: previous runs of this theme. Each
+    record is the LAST-cycle snapshot of that run (per Q4 design decision).
+    """
     metrics = MetricsTracker()
+    memory_context = memory_context or []
 
-    # ---- Brain (single shot) ----
     brain_cfg = ROLE_CONFIGS["brain"]
-    brain = LLMNode(
-        system_prompt=build_brain_system_prompt(),
-        role="brain",
-        max_steps=brain_cfg["max_steps"],
-        model=brain_cfg["model"],
-        temperature=brain_cfg["temperature"],
-        max_tokens=brain_cfg["max_tokens"],
-        metrics_tracker=metrics,
-    )
-    initial_input = build_initial_input(theme_desc, TARGET_LEN)
+    trajectory: list[dict] = []
+    step_counter = [0]
 
-    n0 = len(metrics.calls)
-    brain_response = brain.run(initial_input)
-    brain_output = (brain_response.get("text") or "").strip()
-    brain_calls = metrics.calls[n0:]
-    print(f"  brain design:  "
-          f"in={sum(c.input_tokens for c in brain_calls):>5}  "
-          f"out={sum(c.output_tokens for c in brain_calls):>5}", flush=True)
-    brain_tokens = {
-        "in": sum(c.input_tokens for c in brain_calls),
-        "out": sum(c.output_tokens for c in brain_calls),
-    }
+    def next_step() -> int:
+        step_counter[0] += 1
+        return step_counter[0]
 
-    trajectory: list[dict] = [{
-        "step": 1,
-        "role": "brain",
-        "purpose": "design workflow",
-        "input": initial_input,
-        "output": brain_output,
-        "tokens": brain_tokens,
-    }]
+    cycles: list[dict] = []          # full per-cycle records (this run)
+    final_text = ""
+    final_length = 0
+    hit = False
+    overall_error = None
 
-    plan = parse_workflow(brain_output)
-    if plan is None or "workflow" not in plan:
-        # Brain failed to produce a parseable workflow — terminate here.
-        trajectory.append({
-            "step": 2,
-            "role": "system",
-            "purpose": "PLAN_UNPARSEABLE",
-            "input": None,
-            "output": "Could not parse brain output as JSON containing a 'workflow' key",
-            "tokens": {"in": 0, "out": 0},
-        })
-        return _build_run_record(
-            theme_id, theme_desc, run_idx, output_dir,
-            hit=False, final_text="", final_length=0,
-            trajectory=trajectory, strategy_notes="",
-            workflow=None, writer_calls_used=0,
-            error="plan_unparseable", metrics=metrics,
+    for cycle_idx in range(1, NUM_CYCLES + 1):
+        # ---- Brain call: fresh LLMNode so message history doesn't grow ----
+        brain_node = LLMNode(
+            system_prompt=build_brain_system_prompt(),
+            role="brain",
+            max_steps=brain_cfg["max_steps"],
+            model=brain_cfg["model"],
+            temperature=brain_cfg["temperature"],
+            max_tokens=brain_cfg["max_tokens"],
+            metrics_tracker=metrics,
+        )
+        # Slim view of past cycles for brain's prompt (drop bulky fields like
+        # full trajectory — keep just what the prompt template uses).
+        prior_for_brain = [
+            {
+                "cycle": c["cycle"],
+                "workflow_json": c["workflow_json"],
+                "final_story": c["final_story"],
+                "final_length": c["final_length"],
+                "hit": c["hit"],
+                "strategy_notes": c["strategy_notes"],
+            }
+            for c in cycles
+        ]
+        user_input = build_cycle_input(
+            theme_desc=theme_desc,
+            cycle_idx=cycle_idx,
+            total_cycles=NUM_CYCLES,
+            target_len=TARGET_LEN,
+            cross_run_memory=memory_context,
+            within_run_history=prior_for_brain,
         )
 
-    workflow = plan.get("workflow")
-    strategy_notes = plan.get("strategy_notes", "")
+        n0 = len(metrics.calls)
+        brain_response = brain_node.run(user_input)
+        brain_output = (brain_response.get("text") or "").strip()
+        new_calls = metrics.calls[n0:]
+        brain_tokens = {
+            "in": sum(c.input_tokens for c in new_calls),
+            "out": sum(c.output_tokens for c in new_calls),
+        }
+        trajectory.append({
+            "step": next_step(),
+            "role": "brain",
+            "purpose": f"design cycle {cycle_idx} workflow",
+            "input": user_input,
+            "output": brain_output,
+            "tokens": brain_tokens,
+        })
+        mem_note = (f" (sees {len(memory_context)} cross-run + "
+                    f"{len(prior_for_brain)} within-run)"
+                    if memory_context or prior_for_brain else "")
+        print(f"  cycle {cycle_idx}: brain design{mem_note}", flush=True)
 
-    # ---- Execute workflow ----
-    ctx = ExecutionContext(
-        theme=theme_desc, target_len=TARGET_LEN,
-        metrics=metrics, trajectory=trajectory, starting_step=len(trajectory),
-    )
-    error = None
-    try:
-        execute(workflow, ctx)
-    except WorkflowError as e:
-        error = f"workflow_error: {e}"
-        ctx.step += 1
-        ctx.trajectory.append({
-            "step": ctx.step,
-            "role": "system",
-            "purpose": "INTERPRETER_ERROR",
-            "input": None,
-            "output": str(e),
-            "tokens": {"in": 0, "out": 0},
+        plan = parse_workflow(brain_output)
+        if plan is None or "workflow" not in plan:
+            trajectory.append({
+                "step": next_step(),
+                "role": "system",
+                "purpose": f"PLAN_UNPARSEABLE (cycle {cycle_idx})",
+                "input": None,
+                "output": "Could not parse brain output as JSON with a 'workflow' key",
+                "tokens": {"in": 0, "out": 0},
+            })
+            cycles.append({
+                "cycle": cycle_idx,
+                "workflow_json": None,
+                "strategy_notes": "",
+                "final_story": final_text,
+                "final_length": final_length,
+                "hit": False,
+                "writer_calls_used_in_cycle": 0,
+                "error": "plan_unparseable",
+            })
+            overall_error = "plan_unparseable"
+            # Continue to next cycle — brain might recover
+            continue
+
+        workflow = plan.get("workflow")
+        strategy_notes = plan.get("strategy_notes", "")
+
+        # ---- Execute this cycle's workflow ----
+        # Fresh ExecutionContext per cycle so the per-cycle writer cap resets.
+        ctx = ExecutionContext(
+            theme=theme_desc, target_len=TARGET_LEN,
+            metrics=metrics, trajectory=trajectory,
+            starting_step=step_counter[0],
+        )
+        cycle_error = None
+        try:
+            execute(workflow, ctx)
+        except WorkflowError as e:
+            cycle_error = f"workflow_error: {e}"
+            ctx.step += 1
+            ctx.trajectory.append({
+                "step": ctx.step,
+                "role": "system",
+                "purpose": f"INTERPRETER_ERROR (cycle {cycle_idx})",
+                "input": None,
+                "output": str(e),
+                "tokens": {"in": 0, "out": 0},
+            })
+        # Sync step counter to ctx's
+        step_counter[0] = ctx.step
+
+        # Cycle outcome — empty workflow execution leaves ctx.last_text="".
+        # In that case keep the carry-over text from prior cycle so the next
+        # cycle still has something to look at.
+        if ctx.last_text:
+            final_text = ctx.last_text
+            final_length = ctx.last_length
+        cycle_hit = ctx.last_length == TARGET_LEN
+
+        # strategy_validated: did the cycle's planned multi-step strategy
+        # actually contribute to the outcome? Defined as: NOT (Pass AND
+        # writer_calls == 1). A Pass on the very first writer call means
+        # the strategy was cut short by a lucky cold-start hit before any
+        # later step (length_checker → if → minimal-edit) could run.
+        strategy_validated = ctx.writer_calls >= 1 and not (
+            cycle_hit and ctx.writer_calls == 1
+        )
+        cycles.append({
+            "cycle": cycle_idx,
+            "workflow_json": workflow,
+            "strategy_notes": strategy_notes,
+            "final_story": final_text,
+            "final_length": final_length,
+            "hit": cycle_hit,
+            "writer_calls_used_in_cycle": ctx.writer_calls,
+            "strategy_validated": strategy_validated,
+            "error": cycle_error,
         })
 
-    # ---- Determine outcome (HIT iff last_length == 241) ----
-    hit = ctx.last_length == TARGET_LEN
-    final_text = ctx.last_text
-    final_length = ctx.last_length
+        if cycle_hit:
+            hit = True
+            print(f"  cycle {cycle_idx}: Pass — exiting run early", flush=True)
+            break
 
-    return _build_run_record(
-        theme_id, theme_desc, run_idx, output_dir,
-        hit=hit, final_text=final_text, final_length=final_length,
-        trajectory=ctx.trajectory, strategy_notes=strategy_notes,
-        workflow=workflow, writer_calls_used=ctx.writer_calls,
-        error=error, metrics=metrics,
-    )
-
-
-def _build_run_record(theme_id, theme_desc, run_idx, output_dir, *,
-                      hit, final_text, final_length, trajectory,
-                      strategy_notes, workflow, writer_calls_used,
-                      error, metrics) -> dict:
+    # ---- Save story (HIT or last MISS) ----
     theme_dir = os.path.join(output_dir, theme_id)
     os.makedirs(theme_dir, exist_ok=True)
-    with open(os.path.join(theme_dir, f"run_{run_idx}.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(theme_dir, f"run_{run_idx}.txt"),
+              "w", encoding="utf-8") as f:
         f.write(final_text)
 
     by_role = metrics.by_role()
     total_in = sum(r["input_tokens"] for r in by_role.values())
     total_out = sum(r["output_tokens"] for r in by_role.values())
+    total_writer_calls = sum(c.get("writer_calls_used_in_cycle", 0) for c in cycles)
 
     return {
         "theme_id": theme_id,
@@ -704,11 +1039,12 @@ def _build_run_record(theme_id, theme_desc, run_idx, output_dir, *,
         "run_idx": run_idx,
         "hit": hit,
         "final_length": final_length,
-        "writer_calls_used": writer_calls_used,
-        "strategy_notes": strategy_notes,
-        "workflow": workflow,
+        "cycles_used": len(cycles),
+        "writer_calls_used": total_writer_calls,
+        "cycles": cycles,
         "trajectory": trajectory,
-        "error": error,
+        "memory_seen": list(memory_context or []),
+        "error": overall_error,
         "tokens_by_role": by_role,
         "tokens_total_input": total_in,
         "tokens_total_output": total_out,
@@ -728,27 +1064,85 @@ def main() -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     started_at = datetime.now().isoformat(timespec="seconds")
+    max_writer = NUM_CYCLES * WRITER_CALL_CAP_PER_CYCLE
     print(f"=== method_brain (story task) started {started_at} ===")
     print(f"  themes  : {len(THEMES)}")
     print(f"  runs    : {RUNS_PER_THEME} per theme")
-    print(f"  budget  : {WRITER_CALL_CAP} writer calls per run")
+    print(f"  loop    : {NUM_CYCLES} cycles per run "
+          f"(each cycle: brain → workflow → execute)")
+    print(f"  budget  : {WRITER_CALL_CAP_PER_CYCLE} writer calls per cycle "
+          f"(max {max_writer} writer calls per run)")
     print(f"  target  : exactly {TARGET_LEN} characters")
     print(f"  output  : {output_dir}")
 
     all_results: list[dict] = []
+    # Per-theme cross-run memory. Per Q4 decision, each previous run's record
+    # is the LAST-cycle snapshot (which transitively contains the learning
+    # from earlier cycles in that run, so older snapshots are redundant).
+    theme_memory: dict[str, list[dict]] = {}
     for theme_id, theme_desc in THEMES:
+        theme_memory[theme_id] = []
         for run_idx in range(1, RUNS_PER_THEME + 1):
             print(f"\n--- {theme_id} run {run_idx}/{RUNS_PER_THEME} ---")
-            r = run_one(theme_id, theme_desc, run_idx, output_dir)
+            r = run_one(theme_id, theme_desc, run_idx, output_dir,
+                        memory_context=list(theme_memory[theme_id]))
             all_results.append(r)
-            status = "HIT" if r["hit"] else f"MISS (len={r['final_length']})"
+
+            # Build cross-run memory entry: last + nearest cycle, but ONLY
+            # among cycles where the strategy actually ran to validation
+            # (not first-call cold-start luck). This keeps brain from
+            # learning false positives — a Pass that came from writer #1
+            # luck doesn't carry information about the strategy.
+            #
+            #   last_cycle    — last validated cycle in the run
+            #   nearest_cycle — validated cycle with smallest |length - target|
+            #
+            # If the run had NO validated cycles (e.g. all passes were
+            # cold-start luck, or workflow errors throughout), both
+            # snapshots are None; brain sees "run X: hit=Pass overall,
+            # but no validated cycle data — the pass was luck".
+            def _cycle_snapshot(c: dict | None) -> dict | None:
+                if c is None:
+                    return None
+                return {
+                    "cycle": c.get("cycle"),
+                    "final_length": c.get("final_length"),
+                    "hit": c.get("hit", False),
+                    "strategy_notes": c.get("strategy_notes", ""),
+                    "workflow_json": c.get("workflow_json"),
+                    "final_story": c.get("final_story", ""),
+                    "strategy_validated": c.get("strategy_validated", True),
+                }
+
+            cycles = r["cycles"] or []
+            validated_cycles = [c for c in cycles if c.get("strategy_validated")]
+            last_cycle = validated_cycles[-1] if validated_cycles else None
+            nearest_cycle = (
+                min(validated_cycles,
+                    key=lambda c: abs(c.get("final_length", 0) - TARGET_LEN))
+                if validated_cycles else None
+            )
+            mem_entry = {
+                "run_idx": run_idx,
+                "cycles_used": r["cycles_used"],
+                "hit": r["hit"],
+                "final_length": r["final_length"],
+                "had_validated_strategy": bool(validated_cycles),
+                "last_cycle": _cycle_snapshot(last_cycle),
+                "nearest_cycle": _cycle_snapshot(nearest_cycle),
+            }
+            theme_memory[theme_id].append(mem_entry)
+
+            status = "Pass" if r["hit"] else f"Fail (len={r['final_length']})"
             err = f"  [error: {r['error']}]" if r.get("error") else ""
             by_role = r["tokens_by_role"]
             brain_in = by_role.get("brain", {}).get("input_tokens", 0)
             brain_out = by_role.get("brain", {}).get("output_tokens", 0)
             writer_in = by_role.get("writer", {}).get("input_tokens", 0)
             writer_out = by_role.get("writer", {}).get("output_tokens", 0)
-            print(f"  → run result: {status}  | writer calls: {r['writer_calls_used']}/{WRITER_CALL_CAP}{err}")
+            print(f"  → run result: {status}  | "
+                  f"cycles: {r['cycles_used']}/{NUM_CYCLES}  | "
+                  f"writer calls: {r['writer_calls_used']}/{max_writer}{err}")
             print(f"     tokens — brain: in={brain_in}, out={brain_out}  |  "
                   f"writer: in={writer_in}, out={writer_out}")
 
@@ -776,7 +1170,9 @@ def main() -> None:
         "config": {
             "target_len": TARGET_LEN,
             "runs_per_theme": RUNS_PER_THEME,
-            "writer_call_cap": WRITER_CALL_CAP,
+            "num_cycles": NUM_CYCLES,
+            "writer_call_cap_per_cycle": WRITER_CALL_CAP_PER_CYCLE,
+            "max_writer_calls_per_run": NUM_CYCLES * WRITER_CALL_CAP_PER_CYCLE,
             "themes": [{"id": t[0], "desc": t[1]} for t in THEMES],
             "writer_role_config": ROLE_CONFIGS["writer"],
             "brain_role_config": ROLE_CONFIGS["brain"],
@@ -797,16 +1193,31 @@ def main() -> None:
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
+    # Per-theme accuracy — two metrics (see _metrics.py)
+    from runners.story_task._metrics import per_theme_counts, overall_counts
+    by_theme = per_theme_counts(summary, "method_brain")
+    overall = overall_counts(summary, "method_brain")
+
+    def _fmt(num: int, den: int) -> str:
+        return f"{num}/{den} ({num/den:.0%})" if den else "(no data)"
+
     print()
     print("=" * 60)
-    print(f"method_brain summary")
+    print("method_brain summary")
     print("=" * 60)
-    print(f"  hit rate     : {hits}/{total_runs} ({summary['totals']['hit_rate']:.0%})")
-    print(f"  tokens total : in={sum_in}, out={sum_out}, sum={sum_in + sum_out}")
-    print(f"  per-role     :")
-    for role_name, m in grand_by_role.items():
-        print(f"    [{role_name}] {m['calls']} calls, "
-              f"in={m['input_tokens']}, out={m['output_tokens']}")
+    print(f"  overall pass rate (per run)       : "
+          f"{_fmt(overall['runs_hits'], overall['runs_total'])}")
+    print(f"  overall pass rate (per cycle)     : "
+          f"{_fmt(overall['cycle_hits'], overall['cycle_total'])}")
+    print(f"  overall pass rate (validated)     : "
+          f"{_fmt(overall['validated_hits'], overall['cycle_total'])}")
+    print(f"  per-theme:")
+    for tid, m in by_theme.items():
+        print(f"    {tid:<26} "
+              f"run {_fmt(m['runs_hits'], m['runs_total']):>13}  "
+              f"cyc {_fmt(m['cycle_hits'], m['cycle_total']):>13}  "
+              f"val {_fmt(m['validated_hits'], m['cycle_total']):>13}")
+    print(f"  tokens total     : in={sum_in}, out={sum_out}, sum={sum_in + sum_out}")
     print(f"\nSaved: {summary_path}")
 
     # Auto-render comparison HTML (fail-soft — other methods may be missing)

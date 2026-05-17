@@ -43,17 +43,27 @@ from tool_pool.text_utils import length_checker
 # Task spec — locked across all three story-task methods
 # ---------------------------------------------------------------------------
 
-THEMES: list[tuple[str, str]] = [
-    # Currently scoped to 1 theme for smoke-testing. Uncomment the rest for
-    # the full 4-theme experiment.
+# All 4 canonical themes — filtered at runtime by STORY_THEMES env var.
+_AVAILABLE_THEMES: list[tuple[str, str]] = [
     ("mountain_school",       "The lone teacher at a remote mountain school"),
-    # ("time_displaced_store",  "A convenience store displaced in time"),
-    # ("photo_studio_last_day", "The final day of an old photo studio"),
-    # ("rainy_night_bus",       "The last bus on a rainy night"),
+    ("time_displaced_store",  "A convenience store displaced in time"),
+    ("photo_studio_last_day", "The final day of an old photo studio"),
+    ("rainy_night_bus",       "The last bus on a rainy night"),
 ]
+
+# Runtime filtering: control which themes / how many runs from env vars
+# (typically set by run_all.py --themes / --runs). Defaults: all 4 themes,
+# 4 runs each. Defaults take effect when run as a standalone module.
+_theme_filter = os.environ.get("STORY_THEMES", "").strip()
+if _theme_filter:
+    _wanted = {t.strip() for t in _theme_filter.split(",") if t.strip()}
+    THEMES = [t for t in _AVAILABLE_THEMES if t[0] in _wanted]
+else:
+    THEMES = list(_AVAILABLE_THEMES)
+
+RUNS_PER_THEME = int(os.environ.get("STORY_RUNS_PER_THEME", "4"))
 TARGET_LEN = 241
 WRITER_CALL_CAP = 8                  # max writer calls per (theme, run)
-RUNS_PER_THEME = 4
 
 # If STORY_EXP_NAME is set (typically by run_all.py --exp), put results
 # under story_241/<exp_name>/<method>/. Otherwise default to story_241/<method>/.
@@ -134,11 +144,10 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str) -> di
             "tokens": {"in": 0, "out": 0},
         })
 
-        # Per-attempt live log
-        diff_str = f"(off {verify['diff']:+d})" if not verify["hit"] else "        "
-        status = "HIT" if verify["hit"] else "MISS"
-        print(f"  attempt {attempt_idx}: in={writer_tokens['in']:>5}  "
-              f"out={writer_tokens['out']:>4}  len={verify['length']:>3}  {diff_str}  {status}",
+        # Per-attempt live log: only pass/fail + length + diff
+        diff_str = f"diff={verify['diff']:+d}" if not verify["hit"] else "diff=  0"
+        status = "Pass" if verify["hit"] else "Fail"
+        print(f"  attempt {attempt_idx}: {status}  len={verify['length']:>3}  {diff_str}",
               flush=True)
 
         # Always remember the latest attempt — even if all retries miss, we
@@ -208,7 +217,7 @@ def main() -> None:
             print(f"\n--- {theme_id} run {run_idx}/{RUNS_PER_THEME} ---")
             r = run_one(theme_id, theme_desc, run_idx, output_dir)
             all_results.append(r)
-            status = "HIT" if r["hit"] else f"MISS (len={r['final_length']})"
+            status = "Pass" if r["hit"] else f"Fail (len={r['final_length']})"
             print(f"  → run result: {status}  | writer calls used: {r['writer_calls_used']}/{WRITER_CALL_CAP}"
                   f"  | tokens: in={r['tokens_total_input']}, out={r['tokens_total_output']}")
 
@@ -256,16 +265,28 @@ def main() -> None:
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
+    # Per-theme accuracy — two metrics (see _metrics.py)
+    from runners.story_task._metrics import per_theme_counts, overall_counts
+    by_theme = per_theme_counts(summary, "baseline")
+    overall = overall_counts(summary, "baseline")
+
+    def _fmt(num: int, den: int) -> str:
+        return f"{num}/{den} ({num/den:.0%})" if den else "(no data)"
+
     print()
     print("=" * 60)
-    print(f"baseline summary")
+    print("baseline summary")
     print("=" * 60)
-    print(f"  hit rate     : {hits}/{total_runs} ({summary['totals']['hit_rate']:.0%})")
-    print(f"  tokens total : in={sum_in}, out={sum_out}, sum={sum_in + sum_out}")
-    print(f"  per-role     :")
-    for role_name, m in grand_by_role.items():
-        print(f"    [{role_name}] {m['calls']} calls, "
-              f"in={m['input_tokens']}, out={m['output_tokens']}")
+    print(f"  overall pass rate (per run)   : "
+          f"{_fmt(overall['runs_hits'], overall['runs_total'])}")
+    print(f"  overall pass rate (per cycle) : "
+          f"{_fmt(overall['cycle_hits'], overall['cycle_total'])}")
+    print(f"  per-theme:")
+    for tid, m in by_theme.items():
+        print(f"    {tid:<26} "
+              f"run {_fmt(m['runs_hits'], m['runs_total']):>13}  "
+              f"cyc {_fmt(m['cycle_hits'], m['cycle_total']):>13}")
+    print(f"  tokens total     : in={sum_in}, out={sum_out}, sum={sum_in + sum_out}")
     print(f"\nSaved: {summary_path}")
 
     # Auto-render comparison HTML (fail-soft — other methods may be missing)
