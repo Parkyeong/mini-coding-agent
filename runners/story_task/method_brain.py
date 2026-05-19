@@ -335,6 +335,37 @@ def build_brain_system_prompt() -> str:
     )
 
 
+def _fmt_trace_entry(t: dict) -> str:
+    """One-line compact rendering of a trace step for brain to consume.
+
+    MUST match method_brain_code._fmt_trace_entry exactly so the two
+    methods present identical feedback density to brain. No story text;
+    only writer guidance + lengths and length_checker diff/hit.
+    """
+    kind = t.get("kind", "?")
+    if kind == "writer":
+        prev_len = t.get("previous_attempt_len")
+        mode = "edit" if prev_len else "fresh"
+        gd = (t.get("guidance") or "").replace("\n", " ").strip()
+        if len(gd) > 90:
+            gd = gd[:87] + "..."
+        out_len = t.get("output_len", 0)
+        prev_part = f", prev_len={prev_len}" if prev_len else ""
+        return f"writer({mode}{prev_part}, guidance={gd!r}) → len={out_len}"
+    if kind == "writer_skipped":
+        return "writer(SKIPPED — per-cycle cap reached) → \"\""
+    if kind == "length_checker":
+        length = t.get("length", 0)
+        diff = t.get("diff")
+        hit = t.get("hit")
+        if diff is None:
+            return f"length_checker → length={length}"
+        diff_str = f"{diff:+d}" if diff is not None else "?"
+        return (f"length_checker → length={length}, diff={diff_str}, "
+                f"hit={'Pass' if hit else 'Fail'}")
+    return f"{kind}: {t}"
+
+
 def _render_cross_run_memory_block(memory_context: list[dict]) -> str:
     """Cross-run memory: previous RUNS of the same theme.
 
@@ -375,6 +406,11 @@ def _render_cross_run_memory_block(memory_context: list[dict]) -> str:
             out.append("```json")
             out.append(wf_str)
             out.append("```")
+        trace = snap.get("trace") or []
+        if trace:
+            out.append("trace:")
+            for t in trace:
+                out.append(f"  - {_fmt_trace_entry(t)}")
         return out
 
     lines = [
@@ -432,12 +468,15 @@ def _render_cross_run_memory_block(memory_context: list[dict]) -> str:
 def _render_within_run_history_block(history: list[dict]) -> str:
     """Within-run history: each cycle of THIS run that has already executed.
 
-    Record shape: {cycle, workflow_json, final_story, final_length, hit,
+    Record shape: {cycle, workflow_json, trace, final_length, hit,
                    strategy_notes}
 
-    Brain sees ALL past cycles in this run, including each cycle's full
-    workflow JSON and the final story text (so it can adjust strategy
-    based on what was actually produced).
+    Brain sees ALL past cycles in this run: each cycle's workflow JSON
+    (the plan) + a compact execution trace (writer guidance + lengths,
+    length_checker diff/hit). NO story text — that was a leak of the
+    actual prose, but for strategy refinement brain only needs lengths
+    + structural feedback. Kept in lockstep with method_brain_code so
+    the two methods present identical feedback density to brain.
     """
     if not history:
         return ""
@@ -463,10 +502,11 @@ def _render_within_run_history_block(history: list[dict]) -> str:
             lines.append("```json")
             lines.append(wf_str)
             lines.append("```")
-        fs = (c.get("final_story") or "").strip()
-        if fs:
-            lines.append(f"final_story ({len(fs)} chars):")
-            lines.append(f"  \"{fs}\"")
+        trace = c.get("trace") or []
+        if trace:
+            lines.append("trace:")
+            for t in trace:
+                lines.append(f"  - {_fmt_trace_entry(t)}")
         lines.append("")
     return "\n".join(lines)
 
@@ -560,6 +600,12 @@ class ExecutionContext:
         self.return_value = None
         self.last_text: str = ""
         self.last_length: int = 0
+        # Per-cycle compact trace surfaced to next-cycle brain. Mirrors
+        # method_brain_code's trace shape so the two methods present
+        # equally-dense execution feedback to brain (writer guidance +
+        # lengths, length_checker diff/hit — NO story text). Reset by
+        # the host between cycles via a fresh ExecutionContext.
+        self.trace: list[dict] = []
 
 
 # ---- Value / arg resolution ----------------------------------------------
@@ -685,6 +731,7 @@ def _call_writer(args: dict, ctx: ExecutionContext) -> str:
             "output": None,
             "tokens": {"in": 0, "out": 0},
         })
+        ctx.trace.append({"step": ctx.step, "kind": "writer_skipped"})
         return ""
 
     cfg = ROLE_CONFIGS["writer"]
@@ -725,6 +772,14 @@ def _call_writer(args: dict, ctx: ExecutionContext) -> str:
         "output": story,
         "tokens": tokens,
     })
+    prev_attempt = str(args.get("previous_attempt") or "")
+    ctx.trace.append({
+        "step": ctx.step,
+        "kind": "writer",
+        "guidance": str(args.get("guidance") or ""),
+        "previous_attempt_len": len(prev_attempt) if prev_attempt else 0,
+        "output_len": len(story),
+    })
     # Note: verifier line follows in _call_length_checker, so we don't log here.
     # Brain's workflow always pairs each writer with a length_checker call.
     return story
@@ -751,6 +806,15 @@ def _call_length_checker(args: dict, ctx: ExecutionContext) -> dict:
         "output": result,
         "tokens": {"in": 0, "out": 0},
     })
+    trace_entry = {
+        "step": ctx.step,
+        "kind": "length_checker",
+        "length": result.get("length", 0),
+    }
+    if "diff" in result:
+        trace_entry["diff"] = result["diff"]
+        trace_entry["hit"] = result.get("hit", False)
+    ctx.trace.append(trace_entry)
     # Per-call live log (paired with the most recent writer call).
     # Only pass/fail + length + diff (token info goes to summary.json).
     if result.get("target") is not None:
@@ -900,7 +964,7 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str,
             {
                 "cycle": c["cycle"],
                 "workflow_json": c["workflow_json"],
-                "final_story": c["final_story"],
+                "trace": c.get("trace", []),
                 "final_length": c["final_length"],
                 "hit": c["hit"],
                 "strategy_notes": c["strategy_notes"],
@@ -1008,6 +1072,7 @@ def run_one(theme_id: str, theme_desc: str, run_idx: int, output_dir: str,
             "cycle": cycle_idx,
             "workflow_json": workflow,
             "strategy_notes": strategy_notes,
+            "trace": ctx.trace,
             "final_story": final_text,
             "final_length": final_length,
             "hit": cycle_hit,
@@ -1110,6 +1175,7 @@ def main() -> None:
                     "hit": c.get("hit", False),
                     "strategy_notes": c.get("strategy_notes", ""),
                     "workflow_json": c.get("workflow_json"),
+                    "trace": c.get("trace", []),
                     "final_story": c.get("final_story", ""),
                     "strategy_validated": c.get("strategy_validated", True),
                 }

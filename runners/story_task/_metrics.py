@@ -99,9 +99,11 @@ def per_run_cycle_outcomes(r: dict, method_name: str) -> list[dict]:
             })
         return out
 
-    if method_name == "method_brain" or method_name.startswith("brain_ablation"):
-        # method_brain and brain_ablation_X share the same cycle record
-        # schema (run_one() in both files writes the strategy_validated
+    if (method_name == "method_brain"
+            or method_name == "method_brain_code"
+            or method_name.startswith("brain_ablation")):
+        # method_brain, method_brain_code, and brain_ablation_X share the
+        # same cycle record schema (each writes the strategy_validated
         # field per cycle). Treat them identically here.
         for c in r.get("cycles", []):
             out.append({

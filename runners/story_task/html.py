@@ -37,7 +37,7 @@ from config import WORKSHOP
 
 # Default methods for the standard 3-method comparison. Anything found in
 # BASE_DIR (e.g. brain_ablation_a/b/c/d) is appended at render time.
-DEFAULT_METHODS = ["baseline", "method_fixed", "method_brain"]
+DEFAULT_METHODS = ["baseline", "method_fixed", "method_brain", "method_brain_code"]
 METHODS = list(DEFAULT_METHODS)   # mutated by main() after BASE_DIR is set
 
 # If STORY_EXP_NAME is set, base path becomes story_241/<exp_name>/, matching
@@ -71,10 +71,52 @@ def _discover_methods(base_dir: str) -> list[str]:
 
 
 def _is_brain_method(method_name: str) -> bool:
-    """Methods rendered with the brain-style view (per-cycle workflow tree,
-    luck-Pass badge, validated accuracy column). Covers method_brain and any
-    brain_ablation_X variant produced by brain_ablation.py."""
-    return method_name == "method_brain" or method_name.startswith("brain_ablation")
+    """Methods rendered with the brain-style view (per-cycle plan + execution
+    trace, luck-Pass badge, validated accuracy column). Covers method_brain,
+    method_brain_code, and any brain_ablation_X variant.
+
+    method_brain / brain_ablation render the plan as a JSON workflow tree;
+    method_brain_code renders the plan as Python source. Both share the
+    cross-run memory block and per-cycle trace listing."""
+    return (method_name == "method_brain"
+            or method_name == "method_brain_code"
+            or method_name.startswith("brain_ablation"))
+
+
+def _is_code_brain_method(method_name: str) -> bool:
+    """method_brain_code-specific: render plan as Python `<pre>` source +
+    explicit trace listing, not as a JSON workflow tree."""
+    return method_name == "method_brain_code"
+
+
+def _fmt_trace_entry(t: dict) -> str:
+    """One-line compact rendering of a trace step.
+
+    MUST match runners.story_task.method_brain._fmt_trace_entry and
+    runners.story_task.method_brain_code._fmt_trace_entry so the HTML view
+    is consistent with what brain saw at prompt time."""
+    kind = t.get("kind", "?")
+    if kind == "writer":
+        prev_len = t.get("previous_attempt_len")
+        mode = "edit" if prev_len else "fresh"
+        gd = (t.get("guidance") or "").replace("\n", " ").strip()
+        if len(gd) > 90:
+            gd = gd[:87] + "..."
+        out_len = t.get("output_len", 0)
+        prev_part = f", prev_len={prev_len}" if prev_len else ""
+        return f"writer({mode}{prev_part}, guidance={gd!r}) → len={out_len}"
+    if kind == "writer_skipped":
+        return "writer(SKIPPED — per-cycle cap reached) → \"\""
+    if kind == "length_checker":
+        length = t.get("length", 0)
+        diff = t.get("diff")
+        hit = t.get("hit")
+        if diff is None:
+            return f"length_checker → length={length}"
+        diff_str = f"{diff:+d}" if diff is not None else "?"
+        return (f"length_checker → length={length}, diff={diff_str}, "
+                f"hit={'Pass' if hit else 'Fail'}")
+    return f"{kind}: {t}"
 
 
 # ---------------------------------------------------------------------------
@@ -511,16 +553,36 @@ def _render_memory_block(memory: list, target_len: int) -> str:
         sn = (snap.get("strategy_notes") or "").strip()
         sn_html = (f'<div class="mem-strategy"><em>{esc(sn)}</em></div>'
                    if sn else '')
+        # Plan rendering: workflow JSON tree (method_brain / brain_ablation)
+        # or Python source <pre> (method_brain_code). At most one is set.
         wf = snap.get("workflow_json")
-        wf_html = (
-            f'<details class="cycle-workflow"><summary>{esc(label)} workflow</summary>'
-            f'<div class="workflow-tree">{render_workflow_tree(wf)}</div>'
-            f'</details>'
-        ) if wf else ''
+        code = snap.get("code")
+        if wf:
+            plan_html = (
+                f'<details class="cycle-workflow"><summary>{esc(label)} workflow</summary>'
+                f'<div class="workflow-tree">{render_workflow_tree(wf)}</div>'
+                f'</details>'
+            )
+        elif code:
+            plan_html = (
+                f'<details class="cycle-workflow"><summary>{esc(label)} code</summary>'
+                f'{_pre(code)}'
+                f'</details>'
+            )
+        else:
+            plan_html = ''
+        trace = snap.get("trace") or []
+        trace_html = (
+            f'<details class="cycle-trace"><summary>{esc(label)} trace '
+            f'({len(trace)} steps)</summary>'
+            f'<ul class="trace-list">'
+            + "".join(f'<li>{esc(_fmt_trace_entry(t))}</li>' for t in trace)
+            + '</ul></details>'
+        ) if trace else ''
         return (
             f'<div class="mem-snapshot">'
             f'<div class="mem-snapshot-label">{esc(label)}</div>'
-            f'{badge}{sn_html}{wf_html}'
+            f'{badge}{sn_html}{plan_html}{trace_html}'
             f'</div>'
         )
 
@@ -656,8 +718,9 @@ def render_method_run(method: str, run: dict, target_len: int,
                     f"</div>"
                 )
             extras.append("</details>")
-    # method_brain (and brain_ablation_* variants) — cross-run memory +
-    # per-cycle workflow tree + strategy_notes + luck-Pass badge.
+    # method_brain / method_brain_code / brain_ablation_* — cross-run memory
+    # + per-cycle plan (workflow tree OR python code) + strategy_notes +
+    # execution trace + luck-Pass badge.
     if _is_brain_method(method):
         mem = run.get("memory_seen") or []
         if mem:
@@ -666,13 +729,15 @@ def render_method_run(method: str, run: dict, target_len: int,
         cycles = run.get("cycles") or []
         if cycles:
             extras.append(
-                '<details class="extra" open><summary>per-cycle brain workflows '
+                '<details class="extra" open><summary>per-cycle brain plans '
                 f'({len(cycles)} cycle{"s" if len(cycles) != 1 else ""} executed)'
                 '</summary>'
             )
             for c in cycles:
                 ci = c.get("cycle", "?")
                 wf = c.get("workflow_json")
+                code = c.get("code")
+                trace = c.get("trace") or []
                 sn = (c.get("strategy_notes") or "").strip()
                 fl = c.get("final_length", 0)
                 hit_c = c.get("hit", False)
@@ -702,13 +767,34 @@ def render_method_run(method: str, run: dict, target_len: int,
                               if err_c else "")
                 sn_html = (f"<div class='strategy-notes'>strategy_notes: "
                            f"<em>{esc(sn)}</em></div>" if sn else "")
-                wf_html = (
-                    f"<details class='cycle-workflow'><summary>workflow tree</summary>"
-                    f"<div class='workflow-tree'>{render_workflow_tree(wf)}</div>"
-                    f"</details>"
-                ) if wf else (
-                    "<div class='small'><em>(no workflow — unparseable)</em></div>"
-                )
+
+                # Plan rendering: workflow JSON tree OR python source.
+                if wf:
+                    plan_html = (
+                        "<details class='cycle-workflow' open>"
+                        "<summary>workflow tree</summary>"
+                        f"<div class='workflow-tree'>{render_workflow_tree(wf)}</div>"
+                        "</details>"
+                    )
+                elif code:
+                    plan_html = (
+                        "<details class='cycle-workflow' open>"
+                        "<summary>python code</summary>"
+                        f"{_pre(code)}"
+                        "</details>"
+                    )
+                else:
+                    plan_html = (
+                        "<div class='small'><em>(no plan — unparseable)</em></div>"
+                    )
+
+                trace_html = (
+                    "<details class='cycle-trace' open>"
+                    f"<summary>trace ({len(trace)} steps)</summary>"
+                    "<ul class='trace-list'>"
+                    + "".join(f"<li>{esc(_fmt_trace_entry(t))}</li>" for t in trace)
+                    + "</ul></details>"
+                ) if trace else ""
 
                 extras.append(
                     f"<div class='brain-cycle-row'>"
@@ -716,7 +802,8 @@ def render_method_run(method: str, run: dict, target_len: int,
                     f"<span class='small'>writer×{wcalls}</span>"
                     f"{err_html_c}"
                     f"{sn_html}"
-                    f"{wf_html}"
+                    f"{plan_html}"
+                    f"{trace_html}"
                     f"</div>"
                 )
             extras.append('</details>')
@@ -855,6 +942,7 @@ CSS = """
   .method-run { margin: 4px 0; padding: 4px 8px; border-left: 2px solid #007bff; }
   .method-run[data-method="method_fixed"] { border-left-color: #28a745; }
   .method-run[data-method="method_brain"] { border-left-color: #6f42c1; }
+  .method-run[data-method="method_brain_code"] { border-left-color: #17a2b8; }
   .method-body { padding: 8px 0 8px 16px; }
   .method-missing { padding: 4px 8px; color: #888; }
   .strategy-notes { background: #fff3cd; padding: 6px; margin: 4px 0;
@@ -971,6 +1059,14 @@ CSS = """
   .brain-cycle-row > strong { color: #6f42c1; }
   .cycle-workflow { margin-top: 6px; }
   .cycle-workflow > summary { font-size: 12px; color: #6f42c1; }
+  /* Per-cycle execution trace (method_brain + method_brain_code) */
+  .cycle-trace { margin-top: 6px; }
+  .cycle-trace > summary { font-size: 12px; color: #495057; }
+  .trace-list { margin: 4px 0 4px 16px; padding: 0;
+                font-family: ui-monospace, monospace; font-size: 12px;
+                color: #333; }
+  .trace-list li { margin: 1px 0; padding: 1px 0; list-style: disc;
+                   list-style-position: outside; }
 """
 
 
@@ -988,15 +1084,16 @@ def render_html(summaries: dict) -> str:
         + (f" &middot; Missing: <code>{', '.join(missing)}</code>" if missing else "")
     )
 
+    title_methods = " vs ".join(run_methods) if run_methods else "(no methods)"
     return f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Story Task — 3-method Comparison</title>
+  <title>Story Task — {esc(len(run_methods))}-method Comparison</title>
   <style>{CSS}</style>
 </head>
 <body>
-  <h1>Story Task — Comparison: baseline vs method_fixed vs method_brain</h1>
+  <h1>Story Task — Comparison: {esc(title_methods)}</h1>
   <p class="small">Rendered {esc(rendered_at)}. {status_line}</p>
 
   <h2>Overview</h2>
